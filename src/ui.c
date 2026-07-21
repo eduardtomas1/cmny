@@ -21,8 +21,54 @@ enum {
 typedef enum {
     SCREEN_OVERVIEW,
     SCREEN_ACTIVITY,
-    SCREEN_REPORTS
+    SCREEN_REPORTS,
+    SCREEN_SETTINGS,
+    SCREEN_COUNT
 } Screen;
+
+typedef enum {
+    ACTION_ADD,
+    ACTION_EDIT,
+    ACTION_DELETE,
+    ACTION_UNDO,
+    ACTION_SEARCH,
+    ACTION_FILTER,
+    ACTION_CLEAR,
+    ACTION_BUDGET,
+    ACTION_RECURRING,
+    ACTION_TODAY,
+    ACTION_SETTINGS,
+    ACTION_COUNT
+} UiAction;
+
+typedef struct {
+    const char *label;
+    const char *setting;
+    char default_key;
+} BindingDefinition;
+
+static const BindingDefinition binding_definitions[ACTION_COUNT] = {
+    [ACTION_ADD] = {"Add entry", "key_add", 'a'},
+    [ACTION_EDIT] = {"Edit entry", "key_edit", 'e'},
+    [ACTION_DELETE] = {"Delete entry", "key_delete", 'd'},
+    [ACTION_UNDO] = {"Undo delete", "key_undo", 'u'},
+    [ACTION_SEARCH] = {"Search", "key_search", '/'},
+    [ACTION_FILTER] = {"Change filter", "key_filter", 'f'},
+    [ACTION_CLEAR] = {"Clear search/filter", "key_clear", 'c'},
+    [ACTION_BUDGET] = {"Set budget", "key_budget", 'b'},
+    [ACTION_RECURRING] = {"Recurring entries", "key_recurring", 'r'},
+    [ACTION_TODAY] = {"Current month", "key_today", 't'},
+    [ACTION_SETTINGS] = {"Open settings", "key_settings", 's'}
+};
+
+enum {
+    SETTINGS_THEME,
+    SETTINGS_START_SCREEN,
+    SETTINGS_BINDING_FIRST,
+    SETTINGS_BACKUP = SETTINGS_BINDING_FIRST + ACTION_COUNT,
+    SETTINGS_RESET_KEYS,
+    SETTINGS_ITEM_COUNT
+};
 
 typedef struct {
     short brand;
@@ -48,7 +94,10 @@ typedef struct {
     const CmnyOptions *options;
     const char *db_path;
     Screen screen;
+    Screen start_screen;
     CmnyTheme theme;
+    char bindings[ACTION_COUNT];
+    size_t settings_selected;
     char month[8];
     char search[CMNY_NOTE_MAX + 1];
     int kind_filter;
@@ -94,6 +143,74 @@ static bool has_visible_text(const char *text) {
         if (!isspace(*cursor)) return true;
     }
     return false;
+}
+
+static const char *screen_name(Screen screen) {
+    static const char *names[] = {"overview", "activity", "reports", "settings"};
+    return screen >= SCREEN_OVERVIEW && screen < SCREEN_COUNT ? names[screen] : "overview";
+}
+
+static const char *screen_label(Screen screen) {
+    static const char *labels[] = {"Overview", "Activity", "Reports", "Settings"};
+    return screen >= SCREEN_OVERVIEW && screen < SCREEN_COUNT ? labels[screen] : "Overview";
+}
+
+static bool screen_parse(const char *value, Screen *screen) {
+    if (value == NULL || screen == NULL) return false;
+    for (int i = SCREEN_OVERVIEW; i <= SCREEN_REPORTS; i++) {
+        if (strcmp(value, screen_name((Screen)i)) == 0) {
+            *screen = (Screen)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static int normalize_binding_key(int ch) {
+    if (ch >= 'A' && ch <= 'Z') ch = tolower(ch);
+    if ((ch >= 'a' && ch <= 'z' && ch != 'q') || ch == '/') return ch;
+    return 0;
+}
+
+static bool binding_conflicts(const UiState *state, UiAction action, int ch,
+                              UiAction *conflict) {
+    for (int i = 0; i < ACTION_COUNT; i++) {
+        if (i != (int)action && state->bindings[i] == ch) {
+            if (conflict != NULL) *conflict = (UiAction)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool action_pressed(const UiState *state, UiAction action, int ch) {
+    int normalized = normalize_binding_key(ch);
+    return normalized != 0 && state->bindings[action] == normalized;
+}
+
+static void load_bindings(UiState *state) {
+    char requested[ACTION_COUNT];
+    for (int i = 0; i < ACTION_COUNT; i++) {
+        requested[i] = binding_definitions[i].default_key;
+    }
+    for (int i = 0; i < ACTION_COUNT; i++) {
+        char value[8] = {0};
+        if (!cmny_db_setting_get(state->db, binding_definitions[i].setting,
+                                 value, sizeof(value)) || value[0] == '\0' || value[1] != '\0') {
+            continue;
+        }
+        int key = normalize_binding_key((unsigned char)value[0]);
+        if (key != 0) requested[i] = (char)key;
+    }
+    bool valid = true;
+    for (int i = 0; i < ACTION_COUNT; i++) {
+        for (int j = i + 1; j < ACTION_COUNT; j++) {
+            if (requested[i] == requested[j]) valid = false;
+        }
+    }
+    for (int i = 0; i < ACTION_COUNT; i++) {
+        state->bindings[i] = valid ? requested[i] : binding_definitions[i].default_key;
+    }
 }
 
 static void statusf(UiState *state, const char *format, ...)
@@ -207,9 +324,9 @@ static void draw_header(const UiState *state, int columns) {
                 columns < 70 ? "CMNY" : "CMNY  //  YOUR MONEY, CLEARLY");
     int right = columns - (int)strlen(month_label) - 3;
     if (state->options->demo) {
-        const char *badge = "[ DEMO ]";
+        const char *badge = "[ DEMO - NOT SAVED ]";
         int badge_x = right - (int)strlen(badge) - 2;
-        if (badge_x > 34) {
+        if (badge_x > (columns < 70 ? 7 : 34)) {
             put_clipped(0, badge_x, (int)strlen(badge), badge);
         }
     }
@@ -218,26 +335,49 @@ static void draw_header(const UiState *state, int columns) {
     }
     (void)attroff(A_REVERSE | A_BOLD | attr_color(COLOR_BRAND));
 
-    const char *tabs[] = {"[1] Overview", "[2] Activity", "[3] Reports"};
+    const char *wide_tabs[] = {
+        "[1] Overview", "[2] Activity", "[3] Reports", "[4] Settings"
+    };
+    const char *compact_tabs[] = {"1 Home", "2 Entries", "3 Reports", "4 Settings"};
+    const char *narrow_tabs[] = {"1 Home", "2 List", "3 Stats", "4 Setup"};
+    const char *const *tabs = columns < 52 ? narrow_tabs
+                                          : (columns < 76 ? compact_tabs : wide_tabs);
     int x = 2;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < SCREEN_COUNT; i++) {
         bool active = (int)state->screen == i;
         if (active) (void)attron(A_BOLD | attr_color(COLOR_BRAND));
         put_clipped(1, x, columns - x - 1, tabs[i]);
         if (active) (void)attroff(A_BOLD | attr_color(COLOR_BRAND));
-        x += (int)strlen(tabs[i]) + 3;
+        x += (int)strlen(tabs[i]) + (columns < 76 ? 2 : 3);
         if (x >= columns - 4) break;
     }
 }
 
 static void draw_footer(const UiState *state, int rows, int columns) {
+    char hints[256];
     (void)attron(A_REVERSE | attr_color(COLOR_MUTED));
     (void)mvhline(rows - 1, 0, ' ', columns);
     if (state->status[0] != '\0') {
         put_clipped(rows - 1, 1, columns - 2, state->status);
     } else {
-        put_clipped(rows - 1, 1, columns - 2,
-                    "n add  B budget  r recurring  b backup  p theme  ? help  q quit");
+        if (state->screen == SCREEN_SETTINGS) {
+            (void)snprintf(hints, sizeof(hints),
+                           "Up/Down move  Enter/Left/Right change  Esc back  ? help  q quit");
+        } else if (state->screen == SCREEN_ACTIVITY) {
+            (void)snprintf(hints, sizeof(hints),
+                           "%c add  Enter view  %c edit  %c delete  Esc back  ? help  q quit",
+                           state->bindings[ACTION_ADD], state->bindings[ACTION_EDIT],
+                           state->bindings[ACTION_DELETE]);
+        } else if (state->screen == SCREEN_REPORTS) {
+            (void)snprintf(hints, sizeof(hints),
+                           "%c budget  Left/Right month  Esc back  %c settings  ? help  q quit",
+                           state->bindings[ACTION_BUDGET], state->bindings[ACTION_SETTINGS]);
+        } else {
+            (void)snprintf(hints, sizeof(hints),
+                           "%c add  Enter activity  Left/Right month  %c settings  ? help  q quit",
+                           state->bindings[ACTION_ADD], state->bindings[ACTION_SETTINGS]);
+        }
+        put_clipped(rows - 1, 1, columns - 2, hints);
     }
     (void)attroff(A_REVERSE | attr_color(COLOR_MUTED));
 }
@@ -343,10 +483,16 @@ static void draw_trend(const UiState *state, int y, int x, int height, int width
 }
 
 static void draw_budgets(const UiState *state, int y, int x, int height, int width) {
-    draw_box(y, x, height, width, "BUDGETS  [B] SET");
+    char title[64];
+    (void)snprintf(title, sizeof(title), "BUDGETS  [%c] SET",
+                   state->bindings[ACTION_BUDGET]);
+    draw_box(y, x, height, width, title);
     if (state->budget_count == 0) {
+        char message[96];
+        (void)snprintf(message, sizeof(message), "No budgets yet. Press %c to set one.",
+                       state->bindings[ACTION_BUDGET]);
         (void)attron(A_DIM | attr_color(COLOR_MUTED));
-        put_clipped(y + 2, x + 2, width - 4, "No budgets yet. Press B to set one.");
+        put_clipped(y + 2, x + 2, width - 4, message);
         (void)attroff(A_DIM | attr_color(COLOR_MUTED));
         return;
     }
@@ -382,10 +528,15 @@ static void draw_budgets(const UiState *state, int y, int x, int height, int wid
 static void draw_transaction_rows(const UiState *state, const CmnyTransaction *items, size_t count,
                                   int y, int x, int height, int width, bool selectable) {
     if (count == 0) {
+        char empty[128];
+        if (state->search[0] != '\0' || state->kind_filter != 0) {
+            (void)snprintf(empty, sizeof(empty), "No matches. Press %c to clear filters.",
+                           state->bindings[ACTION_CLEAR]);
+        } else {
+            (void)snprintf(empty, sizeof(empty), "No activity yet. Press %c to add your first entry.",
+                           state->bindings[ACTION_ADD]);
+        }
         (void)attron(A_DIM | attr_color(COLOR_MUTED));
-        const char *empty = (state->search[0] != '\0' || state->kind_filter != 0)
-                                ? "No matches. Press c to clear filters."
-                                : "No activity yet. Press n to add your first entry.";
         put_clipped(y, x, width, empty);
         (void)attroff(A_DIM | attr_color(COLOR_MUTED));
         return;
@@ -540,6 +691,62 @@ static void draw_reports(const UiState *state, int rows, int columns) {
     }
 }
 
+static void settings_item_text(const UiState *state, size_t item,
+                               const char **label, char *value, size_t value_size) {
+    if (item == SETTINGS_THEME) {
+        *label = "Theme";
+        (void)snprintf(value, value_size, "%s", cmny_theme_name(state->theme));
+    } else if (item == SETTINGS_START_SCREEN) {
+        *label = "Start screen";
+        (void)snprintf(value, value_size, "%s", screen_label(state->start_screen));
+    } else if (item >= SETTINGS_BINDING_FIRST && item < SETTINGS_BACKUP) {
+        UiAction action = (UiAction)(item - SETTINGS_BINDING_FIRST);
+        *label = binding_definitions[action].label;
+        (void)snprintf(value, value_size, "[ %c ]", state->bindings[action]);
+    } else if (item == SETTINGS_BACKUP) {
+        *label = "Create backup now";
+        (void)snprintf(value, value_size, "Enter");
+    } else {
+        *label = "Reset keybindings";
+        (void)snprintf(value, value_size, "Enter");
+    }
+}
+
+static void draw_settings(const UiState *state, int rows, int columns) {
+    draw_box(3, 0, rows - 4, columns, "SETTINGS");
+    (void)attron(state->options->demo ? attr_color(COLOR_WARNING)
+                                      : (A_DIM | attr_color(COLOR_MUTED)));
+    put_clipped(4, 2, columns - 4,
+                state->options->demo
+                    ? "Demo settings and entries disappear when you quit."
+                    : "Changes are saved automatically for this ledger.");
+    (void)attroff(state->options->demo ? attr_color(COLOR_WARNING)
+                                       : (A_DIM | attr_color(COLOR_MUTED)));
+
+    int available = max_int(1, rows - 7);
+    size_t first = 0;
+    if (state->settings_selected >= (size_t)available) {
+        first = state->settings_selected - (size_t)available + 1;
+    }
+    for (int row = 0; row < available; row++) {
+        size_t item = first + (size_t)row;
+        if (item >= SETTINGS_ITEM_COUNT) break;
+        const char *label = "";
+        char value[64];
+        settings_item_text(state, item, &label, value, sizeof(value));
+        int y = 5 + row;
+        bool selected = item == state->settings_selected;
+        if (selected) {
+            (void)attron(selection_attr());
+            (void)mvhline(y, 1, ' ', columns - 2);
+        }
+        char line[180];
+        (void)snprintf(line, sizeof(line), "%-26s  %s", label, value);
+        put_clipped(y, 3, columns - 6, line);
+        if (selected) (void)attroff(selection_attr());
+    }
+}
+
 static void draw_resize(int rows, int columns) {
     const char *line1 = "CMNY needs a little more room.";
     char line2[80];
@@ -560,7 +767,8 @@ static void draw(const UiState *state) {
         draw_header(state, columns);
         if (state->screen == SCREEN_OVERVIEW) draw_overview(state, rows, columns);
         else if (state->screen == SCREEN_ACTIVITY) draw_activity(state, rows, columns);
-        else draw_reports(state, rows, columns);
+        else if (state->screen == SCREEN_REPORTS) draw_reports(state, rows, columns);
+        else draw_settings(state, rows, columns);
         draw_footer(state, rows, columns);
     }
     (void)wnoutrefresh(stdscr);
@@ -635,6 +843,63 @@ static bool input_modal(const char *title, const char *label, char *buffer, size
             buffer[length++] = (char)ch;
             buffer[length] = '\0';
         }
+    }
+}
+
+static bool keybinding_modal(const UiState *state, UiAction action, char *result) {
+    (void)timeout(-1);
+    char warning[128] = {0};
+    for (;;) {
+        int rows, columns;
+        getmaxyx(stdscr, rows, columns);
+        int width = min_int(70, columns - 4);
+        int height = 8;
+        int y = max_int(0, (rows - height) / 2);
+        int x = max_int(0, (columns - width) / 2);
+        (void)erase();
+        if (rows < 10 || width < 34) {
+            draw_resize(rows, columns);
+            put_clipped(rows - 1, 0, columns, "Resize terminal or Esc cancel");
+        } else {
+            draw_box(y, x, height, width, "CHANGE KEYBINDING");
+            char line[160];
+            (void)snprintf(line, sizeof(line), "%s  (currently %c)",
+                           binding_definitions[action].label, state->bindings[action]);
+            put_clipped(y + 2, x + 2, width - 4, line);
+            put_clipped(y + 3, x + 2, width - 4,
+                        "Press one letter or /. Uppercase is treated as lowercase.");
+            (void)attron(A_DIM);
+            put_clipped(y + 5, x + 2, width - 4,
+                        "q is reserved for Quit. Esc or Backspace cancels.");
+            (void)attroff(A_DIM);
+            if (warning[0] != '\0') {
+                (void)attron(A_BOLD | attr_color(COLOR_WARNING));
+                put_clipped(y + 6, x + 2, width - 4, warning);
+                (void)attroff(A_BOLD | attr_color(COLOR_WARNING));
+            }
+        }
+        (void)refresh();
+        int ch = getch();
+        if (interrupted || ch == 27 || ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+            (void)timeout(250);
+            return false;
+        }
+        if (ch == KEY_RESIZE) continue;
+        int key = normalize_binding_key(ch);
+        if (key == 0) {
+            (void)snprintf(warning, sizeof(warning),
+                           "That key is reserved. Choose a-z (except q) or /.");
+            continue;
+        }
+        UiAction conflict;
+        if (binding_conflicts(state, action, key, &conflict)) {
+            (void)snprintf(warning, sizeof(warning), "%c is already used by %s.",
+                           key, binding_definitions[conflict].label);
+            continue;
+        }
+        *result = (char)key;
+        (void)timeout(250);
+        return true;
     }
 }
 
@@ -721,36 +986,52 @@ static void message_modal(const char *title, const char *const *lines, size_t co
                 put_clipped(y + 1 + (int)i, x + 2, width - 4, lines[i]);
             }
             (void)attron(A_DIM);
-            put_clipped(y + height - 2, x + 2, width - 4, "Press any key to close");
+            put_clipped(y + height - 2, x + 2, width - 4, "Esc or Enter to go back");
             (void)attroff(A_DIM);
         }
         (void)refresh();
         int ch = getch();
-        if (interrupted || ch != KEY_RESIZE) {
+        if (interrupted || ch == 27 || ch == KEY_BACKSPACE || ch == 127 || ch == 8 ||
+            ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
             (void)timeout(250);
             return;
         }
     }
 }
 
-static void show_help(void) {
-    static const char *lines[] = {
-        "1 / 2 / 3      Overview / Activity / Reports",
-        "n              Add a transaction",
-        "[ / ]          Previous / next month",
-        "t              Jump to the current month",
-        "Up/Down, j/k   Move through activity",
-        "e / d          Edit / delete selected activity",
-        "u              Undo the last deletion",
-        "/              Search every month",
-        "f / c          Cycle filter / clear filters",
-        "B              Set or remove a monthly budget",
-        "R / r / D      Save / apply / delete recurring",
-        "b              Create a timestamped backup",
-        "p              Cycle color theme",
-        "? / q          Help / quit"
-    };
-    message_modal("CMNY HELP", lines, sizeof(lines) / sizeof(lines[0]));
+static void show_help(const UiState *state) {
+    char lines[14][128];
+    const char *items[14];
+    for (size_t i = 0; i < 14; i++) items[i] = lines[i];
+    (void)snprintf(lines[0], sizeof(lines[0]),
+                   "1 / 2 / 3 / 4   Overview / Activity / Reports / Settings");
+    (void)snprintf(lines[1], sizeof(lines[1]),
+                   "Tab / Shift-Tab Move between screens");
+    (void)snprintf(lines[2], sizeof(lines[2]),
+                   "Esc / Backspace Back to Overview; cancel dialogs");
+    (void)snprintf(lines[3], sizeof(lines[3]),
+                   "Left / Right    Previous / next month");
+    (void)snprintf(lines[4], sizeof(lines[4]),
+                   "Up / Down       Move through entries and settings");
+    (void)snprintf(lines[5], sizeof(lines[5]), "%c / %c / %c        Add / edit / delete entry",
+                   state->bindings[ACTION_ADD], state->bindings[ACTION_EDIT],
+                   state->bindings[ACTION_DELETE]);
+    (void)snprintf(lines[6], sizeof(lines[6]), "%c / %c / %c        Search / filter / clear",
+                   state->bindings[ACTION_SEARCH], state->bindings[ACTION_FILTER],
+                   state->bindings[ACTION_CLEAR]);
+    (void)snprintf(lines[7], sizeof(lines[7]), "%c              Undo the last deletion",
+                   state->bindings[ACTION_UNDO]);
+    (void)snprintf(lines[8], sizeof(lines[8]), "%c              Set or remove a monthly budget",
+                   state->bindings[ACTION_BUDGET]);
+    (void)snprintf(lines[9], sizeof(lines[9]), "%c              Open recurring entry manager",
+                   state->bindings[ACTION_RECURRING]);
+    (void)snprintf(lines[10], sizeof(lines[10]), "%c              Jump to the current month",
+                   state->bindings[ACTION_TODAY]);
+    (void)snprintf(lines[11], sizeof(lines[11]), "%c              Open Settings",
+                   state->bindings[ACTION_SETTINGS]);
+    (void)snprintf(lines[12], sizeof(lines[12]), "Enter          Open or activate selected item");
+    (void)snprintf(lines[13], sizeof(lines[13]), "? / q          Help / quit");
+    message_modal("CMNY HELP", items, sizeof(items) / sizeof(items[0]));
 }
 
 static void edit_transaction(UiState *state, const CmnyTransaction *existing) {
@@ -893,99 +1174,124 @@ static void set_budget(UiState *state) {
     statusf(state, limit == 0 ? "Budget removed for %s." : "Budget saved for %s.", category);
 }
 
-static bool choose_recurring(UiState *state, const char *title, CmnyRecurring *selected) {
-    CmnyRecurring items[CMNY_RECURRING_LIMIT];
-    size_t count = 0;
-    char err[256] = {0};
-    if (!cmny_db_recurring_list(state->db, items, CMNY_RECURRING_LIMIT, &count, err, sizeof(err))) {
-        statusf(state, "Recurring error: %s", err);
-        return false;
-    }
-    if (count == 0) {
-        const char *lines[] = {"No recurring templates yet.",
-                               "Select an activity and press R to save one."};
-        message_modal(title, lines, sizeof(lines) / sizeof(lines[0]));
-        return false;
-    }
+static void recurring_manager(UiState *state) {
+    size_t selected = 0;
+    char notice[180] = {0};
+    bool can_save_selected = state->screen == SCREEN_ACTIVITY && state->transaction_count > 0;
     (void)timeout(-1);
     for (;;) {
+        CmnyRecurring items[CMNY_RECURRING_LIMIT];
+        size_t count = 0;
+        char err[256] = {0};
+        if (!cmny_db_recurring_list(state->db, items, CMNY_RECURRING_LIMIT,
+                                    &count, err, sizeof(err))) {
+            statusf(state, "Recurring error: %s", err);
+            (void)timeout(250);
+            return;
+        }
+        if (count == 0) selected = 0;
+        else if (selected >= count) selected = count - 1;
+
         int rows, columns;
         getmaxyx(stdscr, rows, columns);
-        int width = min_int(78, columns - 4);
-        int height = (int)count + 4;
+        int width = min_int(86, columns - 4);
+        int visible = max_int(1, min_int((int)count, rows - 9));
+        int height = max_int(9, visible + 5);
         int y = max_int(0, (rows - height) / 2);
         int x = max_int(0, (columns - width) / 2);
         (void)erase();
-        if (rows < height + 1 || width < 44) {
+        if (rows < 11 || width < 44) {
             draw_resize(rows, columns);
+            put_clipped(rows - 1, 0, columns, "Resize terminal or Esc go back");
         } else {
-            draw_box(y, x, height, width, title);
-            for (size_t i = 0; i < count; i++) {
-                char amount[64], line[180];
-                cmny_money_format_plain(items[i].amount_cents, amount, sizeof(amount));
-                (void)snprintf(line, sizeof(line), "%zu  %-8s  %-20s  %s  day %d",
-                               i + 1, items[i].kind == CMNY_INCOME ? "Income" : "Expense",
-                               items[i].category, amount, items[i].day_of_month);
-                put_clipped(y + 1 + (int)i, x + 2, width - 4, line);
+            draw_box(y, x, height, width, "RECURRING ENTRIES");
+            size_t first = 0;
+            if (selected >= (size_t)visible) first = selected - (size_t)visible + 1;
+            if (count == 0) {
+                put_clipped(y + 2, x + 2, width - 4, "No recurring entries yet.");
+                put_clipped(y + 3, x + 2, width - 4,
+                            can_save_selected
+                                ? "Press the Add key below to save the selected activity."
+                                : "Go back to Activity, select an entry, then reopen this manager.");
+            } else {
+                for (int row = 0; row < visible; row++) {
+                    size_t index = first + (size_t)row;
+                    if (index >= count) break;
+                    char amount[64], line[200];
+                    cmny_money_format_plain(items[index].amount_cents, amount, sizeof(amount));
+                    (void)snprintf(line, sizeof(line), "%-8s  %-20s  %12s  day %d",
+                                   items[index].kind == CMNY_INCOME ? "Income" : "Expense",
+                                   items[index].category, amount, items[index].day_of_month);
+                    if (index == selected) {
+                        (void)attron(selection_attr());
+                        (void)mvhline(y + 2 + row, x + 1, ' ', width - 2);
+                    }
+                    put_clipped(y + 2 + row, x + 2, width - 4, line);
+                    if (index == selected) (void)attroff(selection_attr());
+                }
             }
+            char hints[180];
+            (void)snprintf(hints, sizeof(hints),
+                           "Up/Down move  Enter add to month  %c save selected  %c delete  Esc back",
+                           state->bindings[ACTION_ADD], state->bindings[ACTION_DELETE]);
             (void)attron(A_DIM);
-            put_clipped(y + height - 2, x + 2, width - 4, "Press a number; Esc cancels");
+            put_clipped(y + height - 2, x + 2, width - 4,
+                        notice[0] != '\0' ? notice : hints);
             (void)attroff(A_DIM);
         }
         (void)refresh();
+        (void)timeout(-1);
         int ch = getch();
-        if (interrupted || ch == 27) { (void)timeout(250); return false; }
-        if (ch == KEY_RESIZE) continue;
-        if (ch >= '1' && ch <= '9' && (size_t)(ch - '1') < count) {
-            *selected = items[ch - '1'];
+        if (interrupted || ch == 27 || ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
             (void)timeout(250);
-            return true;
+            return;
         }
-    }
-}
-
-static void apply_recurring(UiState *state) {
-    CmnyRecurring item = {0};
-    if (!choose_recurring(state, "APPLY RECURRING", &item)) return;
-    CmnyTransaction tx = {0};
-    tx.kind = item.kind;
-    tx.amount_cents = item.amount_cents;
-    (void)snprintf(tx.category, sizeof(tx.category), "%s", item.category);
-    (void)snprintf(tx.note, sizeof(tx.note), "%s", item.note);
-    if (!cmny_date_for_month_day(state->month, item.day_of_month, tx.occurred_on)) return;
-    char err[256] = {0};
-    if (!cmny_db_add(state->db, &tx, NULL, err, sizeof(err))) {
-        statusf(state, "Recurring entry failed: %s", err);
-        return;
-    }
-    refresh_state(state);
-    statusf(state, "Recurring %s added for %s.", item.category, tx.occurred_on);
-}
-
-static void delete_recurring(UiState *state) {
-    CmnyRecurring item = {0};
-    if (!choose_recurring(state, "DELETE RECURRING", &item)) return;
-    char question[160];
-    (void)snprintf(question, sizeof(question), "Delete recurring template %s?", item.category);
-    if (!confirm_modal("DELETE RECURRING", question)) return;
-    char err[256] = {0};
-    if (cmny_db_recurring_delete(state->db, item.id, err, sizeof(err))) {
-        statusf(state, "Recurring template deleted.");
-    } else {
-        statusf(state, "Recurring delete failed: %s", err);
-    }
-}
-
-static void save_recurring(UiState *state) {
-    if (state->screen != SCREEN_ACTIVITY || state->transaction_count == 0) {
-        statusf(state, "Select an activity first, then press R.");
-        return;
-    }
-    char err[256] = {0};
-    if (cmny_db_recurring_add(state->db, &state->transactions[state->selected], err, sizeof(err))) {
-        statusf(state, "Recurring template saved.");
-    } else {
-        statusf(state, "Recurring save failed: %s", err);
+        if (ch == KEY_RESIZE) continue;
+        notice[0] = '\0';
+        if (ch == KEY_UP && selected > 0) {
+            selected--;
+        } else if (ch == KEY_DOWN && selected + 1 < count) {
+            selected++;
+        } else if (action_pressed(state, ACTION_ADD, ch)) {
+            if (!can_save_selected) {
+                (void)snprintf(notice, sizeof(notice),
+                               "Go back to Activity and select an entry first.");
+            } else if (cmny_db_recurring_add(state->db,
+                                              &state->transactions[state->selected],
+                                              err, sizeof(err))) {
+                (void)snprintf(notice, sizeof(notice), "Recurring entry saved.");
+            } else {
+                (void)snprintf(notice, sizeof(notice), "Save failed: %s", err);
+            }
+        } else if (action_pressed(state, ACTION_DELETE, ch) && count > 0) {
+            char question[160];
+            (void)snprintf(question, sizeof(question), "Delete recurring entry %s?",
+                           items[selected].category);
+            if (confirm_modal("DELETE RECURRING", question)) {
+                if (cmny_db_recurring_delete(state->db, items[selected].id,
+                                             err, sizeof(err))) {
+                    (void)snprintf(notice, sizeof(notice), "Recurring entry deleted.");
+                } else {
+                    (void)snprintf(notice, sizeof(notice), "Delete failed: %s", err);
+                }
+            }
+        } else if ((ch == '\n' || ch == '\r' || ch == KEY_ENTER) && count > 0) {
+            CmnyTransaction tx = {0};
+            tx.kind = items[selected].kind;
+            tx.amount_cents = items[selected].amount_cents;
+            (void)snprintf(tx.category, sizeof(tx.category), "%s", items[selected].category);
+            (void)snprintf(tx.note, sizeof(tx.note), "%s", items[selected].note);
+            if (!cmny_date_for_month_day(state->month, items[selected].day_of_month,
+                                         tx.occurred_on)) {
+                (void)snprintf(notice, sizeof(notice), "Could not create a date for this month.");
+            } else if (!cmny_db_add(state->db, &tx, NULL, err, sizeof(err))) {
+                (void)snprintf(notice, sizeof(notice), "Add failed: %s", err);
+            } else {
+                refresh_state(state);
+                (void)snprintf(notice, sizeof(notice), "%s added on %s.",
+                               tx.category, tx.occurred_on);
+            }
+        }
     }
 }
 
@@ -1009,6 +1315,94 @@ static void create_backup(UiState *state) {
     }
 }
 
+static bool save_preference(UiState *state, const char *key, const char *value) {
+    char err[256] = {0};
+    if (cmny_db_setting_set(state->db, key, value, err, sizeof(err))) return true;
+    statusf(state, "Could not save setting: %s", err);
+    return false;
+}
+
+static void change_theme(UiState *state, int direction) {
+    int next_index = ((int)state->theme + direction + (int)CMNY_THEME_COUNT) %
+                     (int)CMNY_THEME_COUNT;
+    CmnyTheme next = (CmnyTheme)next_index;
+    if (colors_active && !apply_theme(next, theme_background)) {
+        statusf(state, "This terminal could not activate the %s theme.", cmny_theme_name(next));
+        return;
+    }
+    if (save_preference(state, "theme", cmny_theme_name(next))) {
+        state->theme = next;
+        statusf(state, "Theme saved: %s.", cmny_theme_name(next));
+    }
+}
+
+static void change_start_screen(UiState *state, int direction) {
+    int count = SCREEN_REPORTS + 1;
+    int next = ((int)state->start_screen + direction + count) % count;
+    Screen screen = (Screen)next;
+    if (save_preference(state, "start_screen", screen_name(screen))) {
+        state->start_screen = screen;
+        statusf(state, "Start screen saved: %s.", screen_label(screen));
+    }
+}
+
+static void reset_keybindings(UiState *state) {
+    if (!confirm_modal("RESET KEYBINDINGS", "Restore every keybinding to its default?")) return;
+    for (int i = 0; i < ACTION_COUNT; i++) {
+        char value[2] = {binding_definitions[i].default_key, '\0'};
+        if (!save_preference(state, binding_definitions[i].setting, value)) return;
+        state->bindings[i] = binding_definitions[i].default_key;
+    }
+    statusf(state, "Keybindings restored to defaults.");
+}
+
+static void handle_settings(UiState *state, int ch) {
+    if (ch == KEY_UP) {
+        if (state->settings_selected > 0) state->settings_selected--;
+        state->status[0] = '\0';
+        return;
+    }
+    if (ch == KEY_DOWN) {
+        if (state->settings_selected + 1 < SETTINGS_ITEM_COUNT) state->settings_selected++;
+        state->status[0] = '\0';
+        return;
+    }
+    if (ch == KEY_HOME) {
+        state->settings_selected = 0;
+        state->status[0] = '\0';
+        return;
+    }
+    if (ch == KEY_END) {
+        state->settings_selected = SETTINGS_ITEM_COUNT - 1;
+        state->status[0] = '\0';
+        return;
+    }
+    bool enter = ch == '\n' || ch == '\r' || ch == KEY_ENTER;
+    if (!enter && ch != KEY_LEFT && ch != KEY_RIGHT) return;
+    int direction = ch == KEY_LEFT ? -1 : 1;
+    if (state->settings_selected == SETTINGS_THEME) {
+        change_theme(state, direction);
+    } else if (state->settings_selected == SETTINGS_START_SCREEN) {
+        change_start_screen(state, direction);
+    } else if (state->settings_selected >= SETTINGS_BINDING_FIRST &&
+               state->settings_selected < SETTINGS_BACKUP) {
+        if (!enter) return;
+        UiAction action = (UiAction)(state->settings_selected - SETTINGS_BINDING_FIRST);
+        char key;
+        if (keybinding_modal(state, action, &key)) {
+            char value[2] = {key, '\0'};
+            if (save_preference(state, binding_definitions[action].setting, value)) {
+                state->bindings[action] = key;
+                statusf(state, "%s key saved as %c.", binding_definitions[action].label, key);
+            }
+        }
+    } else if (state->settings_selected == SETTINGS_BACKUP) {
+        if (enter) create_backup(state);
+    } else if (enter) {
+        reset_keybindings(state);
+    }
+}
+
 static void undo_delete(UiState *state) {
     if (!state->can_undo) {
         statusf(state, "Nothing to undo.");
@@ -1025,7 +1419,7 @@ static void undo_delete(UiState *state) {
 }
 
 static void handle_activity(UiState *state, int ch) {
-    if (ch == KEY_UP || ch == 'k') {
+    if (ch == KEY_UP) {
         if (state->selected > 0) {
             state->selected--;
         } else if (state->activity_offset > 0) {
@@ -1034,7 +1428,7 @@ static void handle_activity(UiState *state, int ch) {
             refresh_state(state);
             if (state->transaction_count > 0) state->selected = state->transaction_count - 1;
         }
-    } else if (ch == KEY_DOWN || ch == 'j') {
+    } else if (ch == KEY_DOWN) {
         if (state->selected + 1 < state->transaction_count) {
             state->selected++;
         } else if (state->activity_offset + state->transaction_count < state->activity_total) {
@@ -1042,21 +1436,20 @@ static void handle_activity(UiState *state, int ch) {
             state->selected = 0;
             refresh_state(state);
         }
-    } else if (ch == 'g') {
+    } else if (ch == KEY_HOME) {
         state->activity_offset = 0;
         state->selected = 0;
         refresh_state(state);
-    } else if (ch == 'G' && state->activity_total > 0) {
+    } else if (ch == KEY_END && state->activity_total > 0) {
         state->activity_offset = ((state->activity_total - 1) / CMNY_TX_LIMIT) * CMNY_TX_LIMIT;
         refresh_state(state);
         if (state->transaction_count > 0) state->selected = state->transaction_count - 1;
-    }
-    else if ((ch == '\n' || ch == '\r' || ch == KEY_ENTER) && state->transaction_count > 0) {
+    } else if ((ch == '\n' || ch == '\r' || ch == KEY_ENTER) && state->transaction_count > 0) {
         show_detail(state, &state->transactions[state->selected]);
-    } else if (ch == 'e' && state->transaction_count > 0) {
+    } else if (action_pressed(state, ACTION_EDIT, ch) && state->transaction_count > 0) {
         CmnyTransaction selected = state->transactions[state->selected];
         edit_transaction(state, &selected);
-    } else if (ch == 'd' && state->transaction_count > 0) {
+    } else if (action_pressed(state, ACTION_DELETE, ch) && state->transaction_count > 0) {
         CmnyTransaction selected = state->transactions[state->selected];
         char question[160];
         (void)snprintf(question, sizeof(question), "Delete %s on %s?", selected.category, selected.occurred_on);
@@ -1066,105 +1459,111 @@ static void handle_activity(UiState *state, int ch) {
                 state->last_deleted = selected;
                 state->can_undo = true;
                 refresh_state(state);
-                statusf(state, "Transaction deleted. Press u to undo.");
+                statusf(state, "Transaction deleted. Press %c to undo.",
+                        state->bindings[ACTION_UNDO]);
             } else {
                 statusf(state, "Delete failed: %s", err);
             }
         }
-    } else if (ch == '/') {
-        char search[sizeof(state->search)];
-        (void)snprintf(search, sizeof(search), "%s", state->search);
-        if (input_modal("SEARCH", "Search category or note across every month", search,
-                        sizeof(search))) {
-            (void)snprintf(state->search, sizeof(state->search), "%s", search);
-            state->selected = 0;
-            state->activity_offset = 0;
-            refresh_state(state);
-        }
-    } else if (ch == 'f') {
-        state->kind_filter = state->kind_filter == 0 ? CMNY_EXPENSE :
-                             state->kind_filter == CMNY_EXPENSE ? CMNY_INCOME : 0;
-        state->selected = 0;
-        state->activity_offset = 0;
-        refresh_state(state);
-    } else if (ch == 'c') {
-        state->search[0] = '\0';
-        state->kind_filter = 0;
-        state->selected = 0;
-        state->activity_offset = 0;
-        refresh_state(state);
     }
 }
 
-static void choose_screen(UiState *state, Screen screen, const char *name) {
+static void choose_screen(UiState *state, Screen screen) {
     state->screen = screen;
-    char err[256] = {0};
-    (void)cmny_db_setting_set(state->db, "screen", name, err, sizeof(err));
+    state->status[0] = '\0';
+}
+
+static void search_activity(UiState *state) {
+    char search[sizeof(state->search)];
+    (void)snprintf(search, sizeof(search), "%s", state->search);
+    if (!input_modal("SEARCH", "Search category or note across every month", search,
+                     sizeof(search))) return;
+    (void)snprintf(state->search, sizeof(state->search), "%s", search);
+    state->selected = 0;
+    state->activity_offset = 0;
+    choose_screen(state, SCREEN_ACTIVITY);
+    refresh_state(state);
+}
+
+static void cycle_filter(UiState *state) {
+    state->kind_filter = state->kind_filter == 0 ? CMNY_EXPENSE :
+                         state->kind_filter == CMNY_EXPENSE ? CMNY_INCOME : 0;
+    state->selected = 0;
+    state->activity_offset = 0;
+    choose_screen(state, SCREEN_ACTIVITY);
+    refresh_state(state);
+}
+
+static void clear_activity_filter(UiState *state) {
+    state->search[0] = '\0';
+    state->kind_filter = 0;
+    state->selected = 0;
+    state->activity_offset = 0;
+    choose_screen(state, SCREEN_ACTIVITY);
+    refresh_state(state);
+}
+
+static void shift_month(UiState *state, int direction) {
+    char shifted[8];
+    if (!cmny_month_shift(state->month, direction, shifted)) return;
+    (void)snprintf(state->month, sizeof(state->month), "%s", shifted);
+    state->selected = 0;
+    state->activity_offset = 0;
+    refresh_state(state);
 }
 
 static void handle_key(UiState *state, int ch) {
     if (ch == 'q' || ch == 'Q') {
         state->running = false;
+    } else if (ch == 27 || ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+        if (state->screen != SCREEN_OVERVIEW) choose_screen(state, SCREEN_OVERVIEW);
+        else state->status[0] = '\0';
     } else if (ch == '1') {
-        choose_screen(state, SCREEN_OVERVIEW, "overview");
+        choose_screen(state, SCREEN_OVERVIEW);
     } else if (ch == '2') {
-        choose_screen(state, SCREEN_ACTIVITY, "activity");
+        choose_screen(state, SCREEN_ACTIVITY);
     } else if (ch == '3') {
-        choose_screen(state, SCREEN_REPORTS, "reports");
-    } else if (ch == 'n' || ch == 'a') {
+        choose_screen(state, SCREEN_REPORTS);
+    } else if (ch == '4') {
+        choose_screen(state, SCREEN_SETTINGS);
+    } else if (ch == '\t') {
+        choose_screen(state, (Screen)(((int)state->screen + 1) % SCREEN_COUNT));
+#ifdef KEY_BTAB
+    } else if (ch == KEY_BTAB) {
+        choose_screen(state,
+                      (Screen)(((int)state->screen + SCREEN_COUNT - 1) % SCREEN_COUNT));
+#endif
+    } else if (ch == '?') {
+        show_help(state);
+    } else if (state->screen == SCREEN_SETTINGS) {
+        handle_settings(state, ch);
+    } else if (action_pressed(state, ACTION_SETTINGS, ch)) {
+        choose_screen(state, SCREEN_SETTINGS);
+    } else if (action_pressed(state, ACTION_ADD, ch)) {
         edit_transaction(state, NULL);
-    } else if (ch == 'u') {
+    } else if (action_pressed(state, ACTION_UNDO, ch)) {
         undo_delete(state);
-    } else if (ch == 'B') {
+    } else if (action_pressed(state, ACTION_SEARCH, ch)) {
+        search_activity(state);
+    } else if (action_pressed(state, ACTION_FILTER, ch)) {
+        cycle_filter(state);
+    } else if (action_pressed(state, ACTION_CLEAR, ch)) {
+        clear_activity_filter(state);
+    } else if (action_pressed(state, ACTION_BUDGET, ch)) {
         set_budget(state);
-    } else if (ch == 'R') {
-        save_recurring(state);
-    } else if (ch == 'r') {
-        apply_recurring(state);
-    } else if (ch == 'D') {
-        delete_recurring(state);
-    } else if (ch == 'b') {
-        create_backup(state);
-    } else if (ch == '[') {
-        char shifted[8];
-        if (cmny_month_shift(state->month, -1, shifted)) {
-            (void)snprintf(state->month, sizeof(state->month), "%s", shifted);
-            state->selected = 0;
-            state->activity_offset = 0;
-            refresh_state(state);
-        }
-    } else if (ch == ']') {
-        char shifted[8];
-        if (cmny_month_shift(state->month, 1, shifted)) {
-            (void)snprintf(state->month, sizeof(state->month), "%s", shifted);
-            state->selected = 0;
-            state->activity_offset = 0;
-            refresh_state(state);
-        }
-    } else if (ch == 't') {
+    } else if (action_pressed(state, ACTION_RECURRING, ch)) {
+        recurring_manager(state);
+    } else if (action_pressed(state, ACTION_TODAY, ch)) {
         cmny_current_month(state->month);
         state->selected = 0;
         state->activity_offset = 0;
         refresh_state(state);
-    } else if (ch == 'p') {
-        if (!colors_active) {
-            statusf(state, "Themes are unavailable when terminal colors are disabled.");
-        } else {
-            CmnyTheme next = (CmnyTheme)(((int)state->theme + 1) % (int)CMNY_THEME_COUNT);
-            if (apply_theme(next, theme_background)) {
-                state->theme = next;
-                char err[256] = {0};
-                (void)cmny_db_setting_set(state->db, "theme", cmny_theme_name(state->theme),
-                                          err, sizeof(err));
-                statusf(state, "Theme: %s", cmny_theme_name(state->theme));
-            } else {
-                statusf(state, "This terminal could not activate the next theme.");
-            }
-        }
-    } else if (ch == '?') {
-        show_help();
+    } else if (ch == KEY_LEFT) {
+        shift_month(state, -1);
+    } else if (ch == KEY_RIGHT) {
+        shift_month(state, 1);
     } else if ((ch == '\n' || ch == '\r' || ch == KEY_ENTER) && state->screen == SCREEN_OVERVIEW) {
-        choose_screen(state, SCREEN_ACTIVITY, "activity");
+        choose_screen(state, SCREEN_ACTIVITY);
     } else if (state->screen == SCREEN_ACTIVITY) {
         handle_activity(state, ch);
     }
@@ -1175,17 +1574,23 @@ int cmny_ui_run(CmnyDb *db, const CmnyOptions *options, const char *db_path) {
     state.db = db;
     state.options = options;
     state.db_path = db_path;
-    state.screen = SCREEN_OVERVIEW;
+    state.start_screen = SCREEN_OVERVIEW;
     state.theme = options->theme;
+    load_bindings(&state);
     char preference[32] = {0};
     if (!options->theme_explicit &&
         cmny_db_setting_get(db, "theme", preference, sizeof(preference))) {
         (void)cmny_theme_parse(preference, &state.theme);
     }
-    if (cmny_db_setting_get(db, "screen", preference, sizeof(preference))) {
-        if (strcmp(preference, "activity") == 0) state.screen = SCREEN_ACTIVITY;
-        else if (strcmp(preference, "reports") == 0) state.screen = SCREEN_REPORTS;
+    if (cmny_db_setting_get(db, "start_screen", preference, sizeof(preference))) {
+        (void)screen_parse(preference, &state.start_screen);
+    } else if (cmny_db_setting_get(db, "screen", preference, sizeof(preference)) &&
+               screen_parse(preference, &state.start_screen)) {
+        char err[256] = {0};
+        (void)cmny_db_setting_set(db, "start_screen", screen_name(state.start_screen),
+                                  err, sizeof(err));
     }
+    state.screen = state.start_screen;
     state.running = true;
     if (options->demo) {
         (void)snprintf(state.month, sizeof(state.month), "2026-07");
@@ -1221,6 +1626,9 @@ int cmny_ui_run(CmnyDb *db, const CmnyOptions *options, const char *db_path) {
     (void)cbreak();
     (void)noecho();
     (void)keypad(stdscr, true);
+#ifdef NCURSES_VERSION
+    (void)set_escdelay(25);
+#endif
     (void)curs_set(0);
     (void)timeout(250);
     if (!options->no_color && has_colors() && start_color() == OK) {

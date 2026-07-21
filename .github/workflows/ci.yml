@@ -39,10 +39,10 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: Linux
-            archive: dist/cmny-v0.2.0-linux-x86_64.tar.gz
+            archive: dist/cmny-v0.3.0-linux-x86_64.tar.gz
           - os: macos-latest
             platform: macOS
-            archive: dist/cmny-v0.2.0-macos-universal.tar.gz
+            archive: dist/cmny-v0.3.0-macos-universal.tar.gz
     steps:
       - uses: actions/checkout@v6
       - name: Run packaged app
@@ -68,7 +68,7 @@ jobs:
       - name: Run packaged app
         shell: pwsh
         run: |
-          Expand-Archive dist/cmny-v0.2.0-windows-x86_64.zip package
+          Expand-Archive dist/cmny-v0.3.0-windows-x86_64.zip package
           $binary = (Get-ChildItem package -Recurse -Filter cmny.exe | Select-Object -First 1).FullName
           if (-not $binary) { throw "cmny.exe is missing" }
           & $binary --version

@@ -16,9 +16,9 @@ on your computer—no account, cloud, ads, or bank connection.
 
 | Your computer | Download |
 |---|---|
-| macOS 11 or newer | [CMNY for Mac](https://github.com/eduardtomas1/cmny/releases/download/v0.2.0/cmny-v0.2.0-macos-universal.tar.gz) |
-| 64-bit Linux | [CMNY for Linux](https://github.com/eduardtomas1/cmny/releases/download/v0.2.0/cmny-v0.2.0-linux-x86_64.tar.gz) |
-| Windows 10 or 11 | [CMNY for Windows](https://github.com/eduardtomas1/cmny/releases/download/v0.2.0/cmny-v0.2.0-windows-x86_64.zip) |
+| macOS 11 or newer | [CMNY for Mac](https://github.com/eduardtomas1/cmny/releases/download/v0.3.0/cmny-v0.3.0-macos-universal.tar.gz) |
+| 64-bit Linux | [CMNY for Linux](https://github.com/eduardtomas1/cmny/releases/download/v0.3.0/cmny-v0.3.0-linux-x86_64.tar.gz) |
+| Windows 10 or 11 | [CMNY for Windows](https://github.com/eduardtomas1/cmny/releases/download/v0.3.0/cmny-v0.3.0-windows-x86_64.zip) |
 
 Extract the download, open a terminal inside its folder, and launch the sample
 ledger:
@@ -37,7 +37,7 @@ each change automatically.
 - See monthly totals, savings, categories, and a six-month trend
 - Set spending budgets and reuse recurring entries such as rent or salary
 - Search every month at once and filter income or expenses
-- Switch between Ocean, Violet, and Amber themes
+- Choose Ocean, Violet, or Amber and make the controls your own
 - Create backups, check your ledger, and move data with CSV files
 - Resize the terminal without losing your work
 
@@ -47,19 +47,24 @@ each change automatically.
 
 | Key | What it does |
 |---|---|
-| `1` `2` `3` | Overview, activity, reports |
-| `n` | Add a register |
-| `Enter` | Open the selected register |
+| `1` `2` `3` `4` | Overview, activity, reports, settings |
+| `Tab` / `Shift+Tab` | Move between screens |
+| `Esc` / `Backspace` | Go back or cancel |
+| Arrow keys | Move through lists or change month |
+| `a` | Add an entry |
+| `Enter` | Open or use the selected item |
 | `e` / `d` / `u` | Edit, delete, undo delete |
 | `/` / `f` / `c` | Search, filter, clear |
-| `[` / `]` | Previous or next month |
-| `B` | Set or remove a monthly budget |
-| `R` / `r` / `D` | Save, use, or remove a recurring entry |
-| `b` | Make a backup beside your ledger |
-| `p` | Change theme |
+| `b` | Set or remove a monthly budget |
+| `r` | Open recurring entries |
+| `s` | Open settings |
 | `?` / `q` | Help, quit |
 
-CMNY remembers your last screen, theme, and common categories for next time.
+Open Settings to change the theme, choose your start screen, remap any action
+key, reset the controls, or make a backup. CMNY remembers those choices and
+saves real entries automatically. Demo changes are intentionally not saved.
+
+![CMNY settings and custom keybindings](assets/screenshots/settings.svg)
 
 ## Keep your data safe
 
@@ -77,6 +82,6 @@ Restores make a safety copy first, imports show a preview, and exports never
 overwrite an existing file. Your ledger is private to your computer account,
 but it is not encrypted, so device encryption is still recommended.
 
-Downloads include [SHA-256 checksums](https://github.com/eduardtomas1/cmny/releases/download/v0.2.0/SHA256SUMS)
+Downloads include [SHA-256 checksums](https://github.com/eduardtomas1/cmny/releases/download/v0.3.0/SHA256SUMS)
 and [GitHub-signed build provenance](https://github.com/eduardtomas1/cmny/attestations).
 CMNY is available under the [Apache License 2.0](LICENSE).

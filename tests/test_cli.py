@@ -41,7 +41,7 @@ def main() -> None:
             encoding="ascii",
         )
 
-        assert run(binary, "--version").stdout == "cmny 0.2.0\n"
+        assert run(binary, "--version").stdout == "cmny 0.3.0\n"
         assert "Ledger check: OK" in run(binary, "--db", str(database), "--check").stdout
         refused = run(binary, "--db", str(database), "--import", str(incoming), expected=1)
         assert "confirmation needs a terminal" in refused.stderr

@@ -289,7 +289,7 @@ def capture(binary: Path, screen: str, theme: str, rows: int, columns: int, outp
     os.close(slave)
     terminal = Terminal(rows, columns)
     read_quiet(master, terminal)
-    key = {"overview": b"1", "activity": b"2", "reports": b"3"}[screen]
+    key = {"overview": b"1", "activity": b"2", "reports": b"3", "settings": b"4"}[screen]
     os.write(master, key)
     read_quiet(master, terminal)
     render_svg(terminal, output, f"cmny --demo  |  {columns}x{rows}  |  {screen}  |  {theme}")
@@ -307,7 +307,9 @@ def capture(binary: Path, screen: str, theme: str, rows: int, columns: int, outp
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, default=Path("build/cmny"))
-    parser.add_argument("--screen", choices=("overview", "activity", "reports"), required=True)
+    parser.add_argument(
+        "--screen", choices=("overview", "activity", "reports", "settings"), required=True
+    )
     parser.add_argument("--theme", choices=("ocean", "violet", "amber"), default="ocean")
     parser.add_argument("--rows", type=int, default=34)
     parser.add_argument("--columns", type=int, default=110)

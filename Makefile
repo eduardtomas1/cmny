@@ -61,6 +61,7 @@ demo: $(BINARY)
 screenshots: $(BINARY)
 	python3 tools/capture_demo.py --screen overview --output assets/screenshots/overview.svg
 	python3 tools/capture_demo.py --screen reports --theme violet --output assets/screenshots/reports.svg
+	python3 tools/capture_demo.py --screen settings --theme amber --output assets/screenshots/settings.svg
 
 $(BUILD_DIR)/test_core: tests/test_core.c src/core.c include/cmny.h tests/test.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/test_core.c src/core.c $(LDFLAGS) -o $@
@@ -79,7 +80,7 @@ test: $(BINARY) $(BUILD_DIR)/test_core $(BUILD_DIR)/test_db $(BUILD_DIR)/test_cs
 	$(BUILD_DIR)/test_csv
 	python3 tests/test_cli.py $(BINARY)
 	python3 tests/test_tui.py $(BINARY)
-	python3 tests/test_capture.py
+	python3 tests/test_capture.py $(BINARY)
 
 check: all test
 

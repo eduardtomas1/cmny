@@ -14,7 +14,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 ZIG_VERSION = "0.15.2"
 SQLITE_NUMBER = "3530300"
 SQLITE_VERSION = "3.53.3"
@@ -260,6 +260,11 @@ def main() -> None:
         if directory.exists():
             shutil.rmtree(directory)
         directory.mkdir(parents=True)
+    DIST.mkdir(parents=True, exist_ok=True)
+    for pattern in ("cmny-v*-*.tar.gz", "cmny-v*-*.zip"):
+        for archive in DIST.glob(pattern):
+            archive.unlink()
+    (DIST / "SHA256SUMS").unlink(missing_ok=True)
 
     macos = BUILD / "macos" / "cmny"
     linux = BUILD / "linux-x86_64" / "cmny"

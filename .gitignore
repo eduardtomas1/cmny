@@ -1,13 +1,19 @@
 # Build products and dependency files
 /build/
+/cmny
+/cmny.exe
 *.o
 *.obj
 *.d
 *.a
+*.lib
 *.so
 *.dylib
 *.dll
 *.exe
+*.pdb
+*.ilk
+*.exp
 *.dSYM/
 compile_commands.json
 
@@ -34,9 +40,15 @@ compile_commands.json
 /coverage/
 /captures/
 /.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
 *.log
 /core
 /core.*
+vgcore.*
 
 # Python helper caches
 __pycache__/
@@ -46,9 +58,13 @@ __pycache__/
 .env
 .env.*
 !.env.example
+.envrc
 
 # Editors and operating systems
 .DS_Store
+.AppleDouble
+Thumbs.db
+Desktop.ini
 .idea/
 .vscode/
 .clangd/

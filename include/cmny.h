@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define CMNY_VERSION "0.2.0"
+#define CMNY_VERSION "0.3.0"
 #define CMNY_CATEGORY_MAX 32
 #define CMNY_NOTE_MAX 120
 #define CMNY_TX_LIMIT 256
