@@ -527,7 +527,7 @@ def main() -> None:
         # Cancel keeps the current space, and Esc then performs universal back.
         send(master, b":")
         send(master, b"backup")
-        cancelled = send(master, b"\x1b", 0.15)
+        cancelled = send_until(master, b"\x1b", (b"BUDGETS", b"RECURRING"))
         assert b"BUDGETS" in cancelled or b"RECURRING" in cancelled, cancelled[-500:]
         previous = send_until(master, b"\x1b", (b"ACTIVITY",))
         assert b"ACTIVITY" in previous, previous[-500:]
@@ -658,16 +658,22 @@ def main() -> None:
             assert b"Backup created:" in backup, backup[-500:]
             send(master, b"\x1bOH")
             mouse_click(master, 8, 7, double=True)
-            send(master, b"\r")
+            mouse_off = send_until(master, b"\r", (b"input is off",))
+            assert b"input is off" in mouse_off, mouse_off[-500:]
         else:
-            # Raw mouse packets are intentionally non-fatal when curses does
-            # not expose mouse support; all required interactions stay keyed.
-            send(master, b"5")
-            send(master, b"\x1bOB")
-            send(master, b"\x1bOB")
-            send(master, b"\r")
-            send(master, b"\r")
-        send(master, b"\x1b\x1bq", 0.4)
+            # A stack without mouse support can interpret a raw probe as
+            # ordinary escape input. Restart cleanly before proving the
+            # equivalent keyboard-only setting path.
+            process.send_signal(signal.SIGINT)
+            drain(master)
+            finish(process, master)
+            process, master = start(binary, mouse_database)
+            manage = send_until(master, b"5", (b"MANAGE",))
+            assert b"MANAGE" in manage, manage[-500:]
+            send(master, b"\x1bOB\x1bOB", 0.2)
+            mouse_off = send_until(master, b"\r\r", (b"input is off",))
+            assert b"input is off" in mouse_off, mouse_off[-500:]
+        send(master, b"q")
         finish(process, master)
 
         with sqlite3.connect(mouse_database) as connection:
