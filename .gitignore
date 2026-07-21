@@ -1,0 +1,48 @@
+# Build products and dependency files
+/build/
+*.o
+*.obj
+*.d
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.dSYM/
+compile_commands.json
+
+# Local CMNY / SQLite data
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+
+# Test, sanitizer, profiler, and coverage output
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+/coverage/
+/captures/
+/.cache/
+*.log
+/core
+/core.*
+
+# Python helper caches
+__pycache__/
+*.py[cod]
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
