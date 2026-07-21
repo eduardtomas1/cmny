@@ -14,7 +14,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 ZIG_VERSION = "0.15.2"
 SQLITE_NUMBER = "3530300"
 SQLITE_VERSION = "3.53.3"

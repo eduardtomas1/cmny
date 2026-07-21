@@ -1,6 +1,6 @@
 <div align="center">
 
-# CMNY
+<h1><img src="assets/logo.svg" width="320" alt="CMNY"></h1>
 
 **Your money, clearly.** A small, private money manager that lives in your terminal.
 
@@ -16,9 +16,9 @@ on your computer—no account, cloud, ads, or bank connection.
 
 | Your computer | Download |
 |---|---|
-| macOS 11 or newer | [CMNY for Mac](https://github.com/eduardtomas1/cmny/releases/download/v0.3.0/cmny-v0.3.0-macos-universal.tar.gz) |
-| 64-bit Linux | [CMNY for Linux](https://github.com/eduardtomas1/cmny/releases/download/v0.3.0/cmny-v0.3.0-linux-x86_64.tar.gz) |
-| Windows 10 or 11 | [CMNY for Windows](https://github.com/eduardtomas1/cmny/releases/download/v0.3.0/cmny-v0.3.0-windows-x86_64.zip) |
+| macOS 11 or newer | [CMNY for Mac](https://github.com/eduardtomas1/cmny/releases/download/v0.3.1/cmny-v0.3.1-macos-universal.tar.gz) |
+| 64-bit Linux | [CMNY for Linux](https://github.com/eduardtomas1/cmny/releases/download/v0.3.1/cmny-v0.3.1-linux-x86_64.tar.gz) |
+| Windows 10 or 11 | [CMNY for Windows](https://github.com/eduardtomas1/cmny/releases/download/v0.3.1/cmny-v0.3.1-windows-x86_64.zip) |
 
 Extract the download, open a terminal inside its folder, and launch the sample
 ledger:
@@ -82,6 +82,6 @@ Restores make a safety copy first, imports show a preview, and exports never
 overwrite an existing file. Your ledger is private to your computer account,
 but it is not encrypted, so device encryption is still recommended.
 
-Downloads include [SHA-256 checksums](https://github.com/eduardtomas1/cmny/releases/download/v0.3.0/SHA256SUMS)
+Downloads include [SHA-256 checksums](https://github.com/eduardtomas1/cmny/releases/download/v0.3.1/SHA256SUMS)
 and [GitHub-signed build provenance](https://github.com/eduardtomas1/cmny/attestations).
 CMNY is available under the [Apache License 2.0](LICENSE).
