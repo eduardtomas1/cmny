@@ -1,4 +1,6 @@
 #include "cmny.h"
+#include "cmny_backup.h"
+#include "cmny_paths.h"
 
 #include <locale.h>
 #include <stdio.h>
@@ -29,9 +31,10 @@ static void print_help(FILE *stream) {
         "Options:\n"
         "  --demo              Open a deterministic in-memory demo\n"
         "  --db PATH           Use a specific SQLite database\n"
+        "  --portable DIR      Keep all CMNY data in this directory\n"
         "  --db-path           Print the resolved database path and exit\n"
         "  --currency CODE     Set a new ledger's two-decimal currency (default: EUR)\n"
-        "  --theme NAME        Use ocean, violet, or amber (default: ocean)\n"
+        "  --theme NAME        Use ocean, violet, amber, high-contrast, or monochrome\n"
         "  --backup PATH       Create a safe SQLite backup and exit\n"
         "  --restore PATH      Restore a CMNY backup and exit\n"
         "  --check             Check ledger health and exit\n"
@@ -42,7 +45,7 @@ static void print_help(FILE *stream) {
         "  --ascii             Force portable ASCII visuals\n"
         "  -h, --help          Show this help\n"
         "  -v, --version       Show the version\n\n"
-        "Environment: CMNY_DB, CMNY_CURRENCY, CMNY_THEME, XDG_DATA_HOME, NO_COLOR\n",
+        "Environment: CMNY_DB, CMNY_HOME, CMNY_CURRENCY, CMNY_THEME, XDG_DATA_HOME, NO_COLOR\n",
         CMNY_VERSION);
 }
 
@@ -77,6 +80,7 @@ int main(int argc, char **argv) {
     const char *restore_path = NULL;
     const char *export_path = NULL;
     const char *import_path = NULL;
+    const char *portable_home = NULL;
     const char *currency_input = getenv("CMNY_CURRENCY");
     const char *theme_input = getenv("CMNY_THEME");
     if (currency_input != NULL && *currency_input == '\0') currency_input = NULL;
@@ -91,6 +95,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--yes") == 0) assume_yes = true;
         else if ((strcmp(argv[i], "--db") == 0 || strcmp(argv[i], "--database") == 0) && i + 1 < argc) {
             options.db_override = argv[++i];
+        } else if (strcmp(argv[i], "--portable") == 0 && i + 1 < argc) {
+            portable_home = argv[++i];
         } else if (strcmp(argv[i], "--currency") == 0 && i + 1 < argc) {
             currency_input = argv[++i];
         } else if (strcmp(argv[i], "--theme") == 0 && i + 1 < argc) {
@@ -125,6 +131,15 @@ int main(int argc, char **argv) {
     }
     bool command_mode = command_count == 1;
 
+    if (options.db_override != NULL && portable_home != NULL) {
+        (void)fprintf(stderr, "cmny: --db and --portable cannot be combined\n");
+        return 2;
+    }
+    if (portable_home != NULL && *portable_home == '\0') {
+        (void)fprintf(stderr, "cmny: --portable needs a non-empty directory\n");
+        return 2;
+    }
+
     if (options.demo && (options.db_override != NULL || command_mode)) {
         (void)fprintf(stderr, "cmny: --demo cannot be combined with --db or data commands\n");
         return 2;
@@ -135,7 +150,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (theme_input != NULL && !cmny_theme_parse(theme_input, &options.theme)) {
-        (void)fprintf(stderr, "cmny: theme must be ocean, violet, or amber\n");
+        (void)fprintf(stderr,
+                      "cmny: theme must be ocean, violet, amber, high-contrast, or monochrome\n");
         return 2;
     }
     options.theme_explicit = theme_input != NULL;
@@ -144,7 +160,9 @@ int main(int argc, char **argv) {
 
     char path[4096] = {0};
     char err[256] = {0};
-    if (!options.demo && !cmny_resolve_db_path(options.db_override, path, sizeof(path), err, sizeof(err))) {
+    if (!options.demo &&
+        !cmny_resolve_db_path_for_home(options.db_override, portable_home,
+                                       path, sizeof(path), err, sizeof(err))) {
         (void)fprintf(stderr, "cmny: %s\n", err);
         return 1;
     }
@@ -188,6 +206,18 @@ int main(int argc, char **argv) {
         (void)fprintf(stderr, "cmny: cannot prepare demo: %s\n", err);
         cmny_db_close(&db);
         return 1;
+    }
+
+    if (!options.demo && !command_mode && database_existed) {
+        bool created = false;
+        char automatic_path[4200] = {0};
+        char automatic_error[256] = {0};
+        /* ponytail: fixed daily seven-copy rotation; add knobs only when users need them. */
+        if (!cmny_backup_run_if_due(&db, path, (int64_t)time(NULL), 24U, 7U,
+                                    &created, automatic_path, sizeof(automatic_path),
+                                    automatic_error, sizeof(automatic_error))) {
+            (void)fprintf(stderr, "cmny: automatic backup warning: %s\n", automatic_error);
+        }
     }
 
     if (command_mode) {

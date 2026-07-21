@@ -1,4 +1,5 @@
 #include "cmny.h"
+#include "cmny_paths.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -21,15 +22,34 @@ static bool path_separator(char ch) {
 #endif
 }
 
-bool cmny_resolve_db_path(const char *override_path, char *out, size_t out_size,
-                          char *err, size_t err_size) {
+bool cmny_resolve_db_path_for_home(const char *override_path, const char *portable_home,
+                                   char *out, size_t out_size,
+                                   char *err, size_t err_size) {
     const char *path = override_path;
-    if (path == NULL || *path == '\0') {
+    if ((path == NULL || *path == '\0') &&
+        (portable_home == NULL || *portable_home == '\0')) {
         path = getenv("CMNY_DB");
     }
     if (path != NULL && *path != '\0') {
         if (snprintf(out, out_size, "%s", path) >= (int)out_size) {
             (void)snprintf(err, err_size, "database path is too long");
+            return false;
+        }
+        return true;
+    }
+
+    const char *portable = portable_home;
+    if (portable == NULL || *portable == '\0') portable = getenv("CMNY_HOME");
+    if (portable != NULL && *portable != '\0') {
+        size_t length = strlen(portable);
+        while (length > 1 && path_separator(portable[length - 1])) length--;
+#ifdef _WIN32
+        int written = snprintf(out, out_size, "%.*s\\cmny.db", (int)length, portable);
+#else
+        int written = snprintf(out, out_size, "%.*s/cmny.db", (int)length, portable);
+#endif
+        if (written < 0 || (size_t)written >= out_size) {
+            (void)snprintf(err, err_size, "portable data path is too long");
             return false;
         }
         return true;
@@ -77,6 +97,11 @@ bool cmny_resolve_db_path(const char *override_path, char *out, size_t out_size,
     }
     return true;
 #endif
+}
+
+bool cmny_resolve_db_path(const char *override_path, char *out, size_t out_size,
+                          char *err, size_t err_size) {
+    return cmny_resolve_db_path_for_home(override_path, NULL, out, out_size, err, err_size);
 }
 
 static bool ensure_directory(const char *path, char *err, size_t err_size) {

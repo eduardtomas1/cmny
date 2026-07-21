@@ -1,4 +1,5 @@
 #include "cmny.h"
+#include "cmny_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -13,7 +14,7 @@
 #endif
 
 #define CMNY_APPLICATION_ID 1129139801
-#define CMNY_SCHEMA_VERSION 2
+#define CMNY_SCHEMA_VERSION 5
 
 static bool copy_column(char *out, size_t out_size, sqlite3_stmt *stmt, int column);
 
@@ -152,6 +153,15 @@ static bool migrate(CmnyDb *db, char *err, size_t err_size) {
             return false;
         }
     }
+    if (version < 3 && !cmny_migrate_v3(db->handle, err, err_size)) {
+        return false;
+    }
+    if (version < 4 && !cmny_migrate_v4(db->handle, err, err_size)) {
+        return false;
+    }
+    if (version < 5 && !cmny_migrate_v5(db->handle, err, err_size)) {
+        return false;
+    }
 
     sqlite3_stmt *verify = NULL;
     rc = sqlite3_prepare_v2(db->handle,
@@ -161,6 +171,39 @@ static bool migrate(CmnyDb *db, char *err, size_t err_size) {
         "LEFT JOIN recurring AS r ON 0 LIMIT 0", -1, &verify, NULL);
     if (rc != SQLITE_OK) {
         set_db_error(db, err, err_size, "CMNY database schema is incomplete");
+        (void)sqlite3_finalize(verify);
+        return false;
+    }
+    (void)sqlite3_finalize(verify);
+    rc = sqlite3_prepare_v2(db->handle,
+        "SELECT a.id,a.currency_code,c.id,c.marker,c.color,g.id,e.id,e.entry_type,p.id,p.amount_minor,"
+        "x.id,x.amount_minor,et.entry_id FROM accounts a LEFT JOIN categories c ON 0"
+        " LEFT JOIN tags g ON 0 LEFT JOIN entries e ON 0 LEFT JOIN postings p ON 0"
+        " LEFT JOIN allocations x ON 0 LEFT JOIN entry_tags et ON 0 LIMIT 0", -1, &verify, NULL);
+    if (rc != SQLITE_OK) {
+        set_db_error(db, err, err_size, "normalized CMNY database schema is incomplete");
+        (void)sqlite3_finalize(verify);
+        return false;
+    }
+    (void)sqlite3_finalize(verify);
+    rc = sqlite3_prepare_v2(db->handle,
+        "SELECT h.id,he.action_id,hp.action_id,ha.action_id,ht.action_id,rs.id,ri.session_id"
+        " FROM history_actions h LEFT JOIN history_entry_snapshots he ON 0"
+        " LEFT JOIN history_posting_snapshots hp ON 0 LEFT JOIN history_allocation_snapshots ha ON 0"
+        " LEFT JOIN history_tag_snapshots ht ON 0 LEFT JOIN reconciliation_sessions rs ON 0"
+        " LEFT JOIN reconciliation_items ri ON 0 LIMIT 0", -1, &verify, NULL);
+    if (rc != SQLITE_OK) {
+        set_db_error(db, err, err_size, "history or reconciliation schema is incomplete");
+        (void)sqlite3_finalize(verify);
+        return false;
+    }
+    (void)sqlite3_finalize(verify);
+    rc = sqlite3_prepare_v2(db->handle,
+        "SELECT ip.id,cr.id,ib.id,ir.id,ir.dedupe_active FROM import_profiles ip"
+        " LEFT JOIN categorization_rules cr ON 0 LEFT JOIN import_batches ib ON 0"
+        " LEFT JOIN import_records ir ON 0 LIMIT 0", -1, &verify, NULL);
+    if (rc != SQLITE_OK) {
+        set_db_error(db, err, err_size, "bank import schema is incomplete");
         (void)sqlite3_finalize(verify);
         return false;
     }
@@ -217,6 +260,17 @@ static bool ensure_currency(CmnyDb *db, const char *requested, char currency_out
     if (!ok) set_db_error(db, err, err_size, "cannot store ledger currency");
     (void)sqlite3_finalize(stmt);
     if (ok) (void)snprintf(currency_out, 4, "%s", currency);
+    if (ok) {
+        sqlite3_stmt *account = NULL;
+        rc = sqlite3_prepare_v2(db->handle,
+            "UPDATE accounts SET currency_code=? WHERE currency_code='EUR'"
+            " AND (SELECT COUNT(*) FROM postings)=0", -1, &account, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_bind_text(account, 1, currency, -1, SQLITE_TRANSIENT);
+        if (rc == SQLITE_OK) rc = sqlite3_step(account);
+        ok = rc == SQLITE_DONE;
+        if (!ok) set_db_error(db, err, err_size, "cannot initialize account currency");
+        (void)sqlite3_finalize(account);
+    }
     return ok;
 }
 
@@ -608,6 +662,11 @@ bool cmny_db_check(CmnyDb *db, char *err, size_t err_size) {
     ok = rc == SQLITE_DONE;
     (void)sqlite3_finalize(stmt);
     if (!ok) set_error(err, err_size, "ledger contains invalid recurring data");
+    if (ok && version >= 3) ok = cmny_ledger_integrity_check(db, err, err_size);
+    if (ok && version >= 4) ok = cmny_history_integrity_check(db, err, err_size);
+    if (ok && version >= 4) ok = cmny_reconcile_integrity_check(db, err, err_size);
+    if (ok && version >= 5) ok = cmny_rules_integrity_check(db, err, err_size);
+    if (ok && version >= 5) ok = cmny_import_integrity_check(db, err, err_size);
     return ok;
 }
 
@@ -624,48 +683,14 @@ bool cmny_db_add(CmnyDb *db, const CmnyTransaction *tx, int64_t *new_id,
     if (db == NULL || db->handle == NULL || !valid_transaction(tx, false, err, err_size)) {
         return false;
     }
-    static const char *sql =
-        "INSERT INTO transactions(kind, amount_cents, category, note, occurred_on) VALUES(?, ?, ?, ?, ?)";
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 1, (int)tx->kind);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 2, tx->amount_cents);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 3, tx->category, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 4, tx->note, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 5, tx->occurred_on, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
-    bool ok = rc == SQLITE_DONE;
-    if (!ok) {
-        set_db_error(db, err, err_size, "cannot save transaction");
-    } else if (new_id != NULL) {
-        *new_id = sqlite3_last_insert_rowid(db->handle);
-    }
-    (void)sqlite3_finalize(stmt);
-    return ok;
+    return cmny_legacy_transaction_add(db, tx, new_id, err, err_size);
 }
 
 bool cmny_db_update(CmnyDb *db, const CmnyTransaction *tx, char *err, size_t err_size) {
     if (db == NULL || db->handle == NULL || !valid_transaction(tx, true, err, err_size)) {
         return false;
     }
-    static const char *sql =
-        "UPDATE transactions SET kind=?, amount_cents=?, category=?, note=?, occurred_on=?, "
-        "updated_at=CAST(strftime('%s','now') AS INTEGER) WHERE id=?";
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 1, (int)tx->kind);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 2, tx->amount_cents);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 3, tx->category, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 4, tx->note, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 5, tx->occurred_on, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 6, tx->id);
-    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
-    bool ok = rc == SQLITE_DONE && sqlite3_changes(db->handle) == 1;
-    if (!ok) {
-        set_db_error(db, err, err_size, "cannot update transaction");
-    }
-    (void)sqlite3_finalize(stmt);
-    return ok;
+    return cmny_legacy_transaction_update(db, tx, err, err_size);
 }
 
 bool cmny_db_delete(CmnyDb *db, int64_t id, char *err, size_t err_size) {
@@ -673,16 +698,7 @@ bool cmny_db_delete(CmnyDb *db, int64_t id, char *err, size_t err_size) {
         set_error(err, err_size, "invalid transaction id");
         return false;
     }
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db->handle, "DELETE FROM transactions WHERE id=?", -1, &stmt, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 1, id);
-    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
-    bool ok = rc == SQLITE_DONE && sqlite3_changes(db->handle) == 1;
-    if (!ok) {
-        set_db_error(db, err, err_size, "cannot delete transaction");
-    }
-    (void)sqlite3_finalize(stmt);
-    return ok;
+    return cmny_legacy_transaction_delete(db, id, err, err_size);
 }
 
 static bool copy_column(char *out, size_t out_size, sqlite3_stmt *stmt, int column) {
@@ -888,9 +904,12 @@ bool cmny_db_category_totals(CmnyDb *db, const char *month, CmnyCategoryTotal *o
     (void)snprintf(start, sizeof(start), "%s-01", month);
     (void)snprintf(end, sizeof(end), "%s-01", next_month);
     static const char *sql =
-        "SELECT category, SUM(amount_cents) AS total FROM transactions "
-        "WHERE kind=1 AND occurred_on>=? AND occurred_on<? "
-        "GROUP BY category ORDER BY total DESC, category LIMIT ?";
+        "SELECT c.name,-SUM(a.amount_minor) AS total FROM entries e"
+        " JOIN postings p ON p.entry_id=e.id JOIN allocations a ON a.posting_id=p.id"
+        " JOIN categories c ON c.id=a.category_id"
+        " WHERE e.entry_type=1 AND e.voided_at IS NULL AND a.amount_minor<0"
+        " AND e.occurred_on>=? AND e.occurred_on<?"
+        " GROUP BY c.id,c.name ORDER BY total DESC,c.name LIMIT ?";
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, start, -1, SQLITE_TRANSIENT);
@@ -951,6 +970,10 @@ bool cmny_db_budget_set(CmnyDb *db, const char *month, const char *category,
         set_error(err, err_size, "invalid budget");
         return false;
     }
+    int64_t category_id = 0;
+    if (limit_cents > 0 && !cmny_internal_category_ensure(db, category, CMNY_CATEGORY_EXPENSE,
+                                                          &category_id, err, err_size)) return false;
+    (void)category_id;
     const char *sql = limit_cents == 0
         ? "DELETE FROM budgets WHERE month=? AND category=?"
         : "INSERT INTO budgets(month,category,limit_cents) VALUES(?,?,?) "
@@ -982,10 +1005,12 @@ bool cmny_db_budget_list(CmnyDb *db, const char *month, CmnyBudget *out, size_t 
     (void)snprintf(start, sizeof(start), "%s-01", month);
     (void)snprintf(end, sizeof(end), "%s-01", next_month);
     static const char *sql =
-        "SELECT b.category,b.limit_cents,COALESCE(SUM(t.amount_cents),0) "
-        "FROM budgets AS b LEFT JOIN transactions AS t ON t.kind=1 "
-        "AND t.category=b.category AND t.occurred_on>=? AND t.occurred_on<? "
-        "WHERE b.month=? GROUP BY b.category,b.limit_cents ORDER BY b.category LIMIT ?";
+        "SELECT b.category,b.limit_cents,COALESCE((SELECT -SUM(a.amount_minor)"
+        " FROM categories c JOIN allocations a ON a.category_id=c.id"
+        " JOIN postings p ON p.id=a.posting_id JOIN entries e ON e.id=p.entry_id"
+        " WHERE c.name=b.category AND a.amount_minor<0 AND e.entry_type=1"
+        " AND e.voided_at IS NULL AND e.occurred_on>=? AND e.occurred_on<?),0)"
+        " FROM budgets b WHERE b.month=? ORDER BY b.category LIMIT ?";
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, start, -1, SQLITE_TRANSIENT);
@@ -1024,6 +1049,11 @@ bool cmny_db_recurring_add(CmnyDb *db, const CmnyTransaction *tx,
         set_error(err, err_size, "invalid recurring template");
         return false;
     }
+    int64_t category_id = 0;
+    int category_mask = tx->kind == CMNY_EXPENSE ? CMNY_CATEGORY_EXPENSE : CMNY_CATEGORY_INCOME;
+    if (!cmny_internal_category_ensure(db, tx->category, category_mask, &category_id,
+                                       err, err_size)) return false;
+    (void)category_id;
     int day = (tx->occurred_on[8] - '0') * 10 + (tx->occurred_on[9] - '0');
     static const char *sql =
         "INSERT OR IGNORE INTO recurring(kind,amount_cents,category,note,day_of_month) "

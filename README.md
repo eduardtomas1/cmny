@@ -2,86 +2,64 @@
 
 <h1><img src="assets/logo.svg" width="320" alt="CMNY"></h1>
 
-**Your money, clearly.** A small, private money manager that lives in your terminal.
+**Your money, clearly.** A private money manager that lives in your terminal.
 
 </div>
 
 ![CMNY monthly overview](assets/screenshots/overview.svg)
 
-CMNY shows what came in, what went out, what you saved, and where your money is
-going. It opens quickly, works entirely from the keyboard, and keeps everything
-on your computer—no account, cloud, ads, or bank connection.
+CMNY keeps income, expenses, accounts, transfers, plans, and savings in one
+fast keyboard-friendly app. Everything stays on your computer—no account,
+cloud, ads, or bank connection.
 
-## Download and try it
+## Download
 
-| Your computer | Download |
+| Your computer | CMNY 1.0.0 |
 |---|---|
-| macOS 11 or newer | [CMNY for Mac](https://github.com/eduardtomas1/cmny/releases/download/v0.3.1/cmny-v0.3.1-macos-universal.tar.gz) |
-| 64-bit Linux | [CMNY for Linux](https://github.com/eduardtomas1/cmny/releases/download/v0.3.1/cmny-v0.3.1-linux-x86_64.tar.gz) |
-| Windows 10 or 11 | [CMNY for Windows](https://github.com/eduardtomas1/cmny/releases/download/v0.3.1/cmny-v0.3.1-windows-x86_64.zip) |
+| macOS 11 or newer | [Download for Mac](https://github.com/eduardtomas1/cmny/releases/download/v1.0.0/cmny-v1.0.0-macos-universal.tar.gz) |
+| 64-bit Linux | [Download for Linux](https://github.com/eduardtomas1/cmny/releases/download/v1.0.0/cmny-v1.0.0-linux-x86_64.tar.gz) |
+| Windows 10 or 11 | [Download for Windows](https://github.com/eduardtomas1/cmny/releases/download/v1.0.0/cmny-v1.0.0-windows-x86_64.zip) |
 
-Extract the download, open a terminal inside its folder, and launch the sample
-ledger:
+Extract the download, open a terminal in its folder, and try the disposable demo:
 
 ```sh
 ./cmny --demo
 ```
 
-On Windows, use `.\cmny.exe --demo`. The demo is completely disposable. When
-you are ready to use your own data, run `./cmny` without `--demo`; CMNY saves
-each change automatically.
+On Windows, use `.\cmny.exe --demo`. Run `./cmny` without `--demo` when you
+want CMNY to save your changes automatically.
 
-## What you can do
+## What it does
 
-- Add, edit, delete, and immediately undo deleted income or expenses
-- See monthly totals, savings, categories, and a six-month trend
-- Set spending budgets and reuse recurring entries such as rent or salary
-- Search every month at once and filter income or expenses
-- Choose Ocean, Violet, or Amber and make the controls your own
-- Create backups, check your ledger, and move data with CSV files
-- Resize the terminal without losing your work
+- Tracks accounts, income, expenses, transfers, categories, and monthly savings
+- Lets you add, edit, delete, search, filter, and safely undo changes
+- Shows spending plans, trends, forecasts, and useful monthly insights
+- Reconciles an account against a statement balance
+- Offers five themes, mouse support, custom controls, and a built-in tutorial
+- Makes rotating backups and moves your data with CSV files
 
-![CMNY budgets and reports in the Violet theme](assets/screenshots/reports.svg)
+![CMNY activity view](assets/screenshots/activity.svg)
 
 ## Everyday keys
 
-| Key | What it does |
+| Key | Action |
 |---|---|
-| `1` `2` `3` `4` | Overview, activity, reports, settings |
-| `Tab` / `Shift+Tab` | Move between screens |
-| `Esc` / `Backspace` | Go back or cancel |
-| Arrow keys | Move through lists or change month |
-| `a` | Add an entry |
-| `Enter` | Open or use the selected item |
-| `e` / `d` / `u` | Edit, delete, undo delete |
+| `1`…`5` | Overview, Activity, Plan, Insights, Manage |
+| `a` / `v` | Add an entry / make a transfer |
+| `e` / `d` / `u` | Edit, delete, undo |
 | `/` / `f` / `c` | Search, filter, clear |
-| `b` | Set or remove a monthly budget |
-| `r` | Open recurring entries |
-| `s` | Open settings |
-| `?` / `q` | Help, quit |
+| `g` / `m` / `l` | Filter accounts, manage accounts, reconcile |
+| `:` / `?` / `q` | Commands, help, quit |
 
-Open Settings to change the theme, choose your start screen, remap any action
-key, reset the controls, or make a backup. CMNY remembers those choices and
-saves real entries automatically. Demo changes are intentionally not saved.
-
-![CMNY settings and custom keybindings](assets/screenshots/settings.svg)
+![CMNY planning view](assets/screenshots/plan.svg)
 
 ## Keep your data safe
 
-Use `cmny --db-path` to see where your ledger lives. You can also run:
+CMNY saves locally and creates automatic rotating backups. Use `cmny --db-path`
+to find your ledger, `cmny --check` to check it, or `cmny --help` for backup,
+restore, import, export, and portable-mode commands. The ledger is not encrypted,
+so device encryption is recommended.
 
-```sh
-cmny --backup my-backup.db
-cmny --restore my-backup.db
-cmny --export my-money.csv
-cmny --import my-money.csv
-cmny --check
-```
-
-Restores make a safety copy first, imports show a preview, and exports never
-overwrite an existing file. Your ledger is private to your computer account,
-but it is not encrypted, so device encryption is still recommended.
-
-Downloads include [SHA-256 checksums](https://github.com/eduardtomas1/cmny/releases/download/v0.3.1/SHA256SUMS)
+Downloads include [SHA-256 checksums](https://github.com/eduardtomas1/cmny/releases/download/v1.0.0/SHA256SUMS)
 and [GitHub-signed build provenance](https://github.com/eduardtomas1/cmny/attestations).
 CMNY is available under the [Apache License 2.0](LICENSE).

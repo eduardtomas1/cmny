@@ -22,6 +22,7 @@ def run(binary: Path, *arguments: str, expected: int = 0) -> subprocess.Complete
 
 def main() -> None:
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else "build/cmny").resolve()
+    version = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="ascii").strip()
     with tempfile.TemporaryDirectory(prefix="cmny-cli-", dir="build") as temporary:
         directory = Path(temporary)
         database = directory / "ledger.db"
@@ -41,8 +42,18 @@ def main() -> None:
             encoding="ascii",
         )
 
-        assert run(binary, "--version").stdout == "cmny 0.3.1\n"
+        assert run(binary, "--version").stdout == f"cmny {version}\n"
         assert "Ledger check: OK" in run(binary, "--db", str(database), "--check").stdout
+        portable = directory / "portable"
+        assert "Ledger check: OK" in run(
+            binary, "--portable", str(portable), "--check"
+        ).stdout
+        assert (portable / "cmny.db").is_file()
+        conflict = run(
+            binary, "--db", str(database), "--portable", str(portable),
+            "--check", expected=2,
+        )
+        assert "cannot be combined" in conflict.stderr
         refused = run(binary, "--db", str(database), "--import", str(incoming), expected=1)
         assert "confirmation needs a terminal" in refused.stderr
         imported = run(binary, "--db", str(database), "--import", str(incoming), "--yes")

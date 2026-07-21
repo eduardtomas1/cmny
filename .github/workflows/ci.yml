@@ -25,9 +25,15 @@ jobs:
         run: make check
       - name: Debug build
         run: make debug
+      - name: Static analysis
+        if: runner.os == 'Linux'
+        run: make analyze
       - name: Sanitizers
         if: runner.os == 'Linux'
         run: make sanitize
+      - name: Parser fuzz smoke tests
+        if: runner.os == 'Linux'
+        run: make fuzz-smoke
 
   unix-packages:
     name: Package smoke test (${{ matrix.platform }})
@@ -39,17 +45,18 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: Linux
-            archive: dist/cmny-v0.3.1-linux-x86_64.tar.gz
+            suffix: linux-x86_64.tar.gz
           - os: macos-latest
             platform: macOS
-            archive: dist/cmny-v0.3.1-macos-universal.tar.gz
+            suffix: macos-universal.tar.gz
     steps:
       - uses: actions/checkout@v6
       - name: Run packaged app
         shell: bash
         run: |
+          archive="dist/cmny-v$(tr -d '\r\n' < VERSION)-${{ matrix.suffix }}"
           mkdir package
-          tar -xzf "${{ matrix.archive }}" -C package
+          tar -xzf "$archive" -C package
           binary="$(find package -type f -name cmny -perm -u+x -print -quit)"
           test -n "$binary"
           "$binary" --version
@@ -68,7 +75,8 @@ jobs:
       - name: Run packaged app
         shell: pwsh
         run: |
-          Expand-Archive dist/cmny-v0.3.1-windows-x86_64.zip package
+          $version = (Get-Content VERSION -Raw).Trim()
+          Expand-Archive "dist/cmny-v$version-windows-x86_64.zip" package
           $binary = (Get-ChildItem package -Recurse -Filter cmny.exe | Select-Object -First 1).FullName
           if (-not $binary) { throw "cmny.exe is missing" }
           & $binary --version

@@ -73,7 +73,12 @@ int main(void) {
     ASSERT_TRUE(cmny_db_open(&db, path, false, "EUR", currency, err, sizeof(err)));
     ASSERT_TRUE(strcmp(currency, "EUR") == 0);
     int schema_version = 0;
-    ASSERT_TRUE(sqlite3_exec(db.handle, "PRAGMA user_version", NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_prepare_v2(db.handle, "PRAGMA user_version", -1, &foreign_check, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_step(foreign_check) == SQLITE_ROW);
+    schema_version = sqlite3_column_int(foreign_check, 0);
+    ASSERT_EQ_I64(5, schema_version);
+    ASSERT_TRUE(sqlite3_finalize(foreign_check) == SQLITE_OK);
+    foreign_check = NULL;
 
     ASSERT_TRUE(sqlite3_exec(db.handle,
         "INSERT INTO transactions(kind,amount_cents,category,note,occurred_on) "
@@ -194,21 +199,17 @@ int main(void) {
     ASSERT_TRUE(sqlite3_open(path, &tampered) == SQLITE_OK);
     ASSERT_TRUE(sqlite3_exec(tampered,
         "PRAGMA ignore_check_constraints=ON;"
-        "INSERT INTO transactions(kind,amount_cents,category,note,occurred_on) "
-        "VALUES(1,-9223372036854775807,'Tampered','','2026-07-03')", NULL, NULL, NULL) == SQLITE_OK);
+        "UPDATE postings SET amount_minor=0 WHERE entry_id=3", NULL, NULL, NULL) == SQLITE_OK);
     ASSERT_TRUE(sqlite3_close(tampered) == SQLITE_OK);
     ASSERT_TRUE(cmny_db_open(&db, path, false, NULL, currency, err, sizeof(err)));
     ASSERT_TRUE(!cmny_db_check(&db, err, sizeof(err)));
-    ASSERT_TRUE(!cmny_db_month_summary(&db, "2026-07", &summary, err, sizeof(err)));
     ASSERT_TRUE(!cmny_db_list(&db, "2026-07", "", 0, 0, rows, 8, &count, err, sizeof(err)));
     cmny_db_close(&db);
     ASSERT_TRUE(sqlite3_open(path, &tampered) == SQLITE_OK);
-    ASSERT_TRUE(sqlite3_exec(tampered, "DELETE FROM transactions WHERE amount_cents < 1",
-                             NULL, NULL, NULL) == SQLITE_OK);
     ASSERT_TRUE(sqlite3_exec(tampered,
         "PRAGMA ignore_check_constraints=ON;"
-        "INSERT INTO transactions(kind,amount_cents,category,note,occurred_on) "
-        "VALUES(1,1,'Long',printf('%121c','x'),'2026-07-03')",
+        "UPDATE postings SET amount_minor=-4000 WHERE entry_id=3;"
+        "UPDATE entries SET note=printf('%241c','x') WHERE id=3",
         NULL, NULL, NULL) == SQLITE_OK);
     ASSERT_TRUE(sqlite3_close(tampered) == SQLITE_OK);
     ASSERT_TRUE(cmny_db_open(&db, path, false, NULL, currency, err, sizeof(err)));
@@ -216,7 +217,7 @@ int main(void) {
     ASSERT_TRUE(!cmny_db_list(&db, "2026-07", "", 0, 0, rows, 8, &count, err, sizeof(err)));
     cmny_db_close(&db);
     ASSERT_TRUE(sqlite3_open(path, &tampered) == SQLITE_OK);
-    ASSERT_TRUE(sqlite3_exec(tampered, "DELETE FROM transactions WHERE category='Long'",
+    ASSERT_TRUE(sqlite3_exec(tampered, "UPDATE entries SET note='Groceries and lunch' WHERE id=3",
                              NULL, NULL, NULL) == SQLITE_OK);
     ASSERT_TRUE(sqlite3_close(tampered) == SQLITE_OK);
 
@@ -241,17 +242,94 @@ int main(void) {
     ASSERT_TRUE(cmny_db_check(&db, err, sizeof(err)));
     cmny_db_close(&db);
 
-    ASSERT_TRUE(sqlite3_open(path, &tampered) == SQLITE_OK);
-    ASSERT_TRUE(sqlite3_exec(tampered,
-        "DROP TABLE budgets; DROP TABLE recurring; PRAGMA user_version=1", NULL, NULL, NULL) == SQLITE_OK);
-    ASSERT_TRUE(sqlite3_close(tampered) == SQLITE_OK);
-    ASSERT_TRUE(cmny_db_open(&db, path, false, NULL, currency, err, sizeof(err)));
+    char v2_path[] = "build/cmny-v2-XXXXXX";
+    int v2_descriptor = mkstemp(v2_path);
+    ASSERT_TRUE(v2_descriptor >= 0);
+    ASSERT_TRUE(close(v2_descriptor) == 0);
+    sqlite3 *v2 = NULL;
+    ASSERT_TRUE(sqlite3_open(v2_path, &v2) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_exec(v2,
+        "CREATE TABLE transactions(id INTEGER PRIMARY KEY,kind INTEGER NOT NULL,amount_cents INTEGER NOT NULL,"
+        "category TEXT NOT NULL,note TEXT NOT NULL,occurred_on TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL) STRICT;"
+        "CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL) STRICT;"
+        "CREATE TABLE budgets(month TEXT NOT NULL,category TEXT NOT NULL,limit_cents INTEGER NOT NULL,PRIMARY KEY(month,category)) STRICT;"
+        "CREATE TABLE recurring(id INTEGER PRIMARY KEY,kind INTEGER NOT NULL,amount_cents INTEGER NOT NULL,category TEXT NOT NULL,"
+        "note TEXT NOT NULL,day_of_month INTEGER NOT NULL,created_at INTEGER NOT NULL,UNIQUE(kind,amount_cents,category,note,day_of_month)) STRICT;"
+        "INSERT INTO settings VALUES('currency','EUR');"
+        "INSERT INTO transactions VALUES(41,1,1250,'Legacy food','Imported','2026-08-04',10,11);"
+        "INSERT INTO transactions VALUES(42,2,9900,'Legacy pay','Imported','2026-08-01',12,13);"
+        "INSERT INTO budgets VALUES('2026-08','Legacy food',5000);"
+        "INSERT INTO recurring VALUES(7,1,1250,'Legacy food','Imported',4,14);"
+        "PRAGMA application_id=1129139801;PRAGMA user_version=2", NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_close(v2) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_open(v2_path, &v2) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_exec(v2, "UPDATE transactions SET amount_cents=0 WHERE id=41",
+                             NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_close(v2) == SQLITE_OK);
+    ASSERT_TRUE(!cmny_db_open(&db, v2_path, false, NULL, currency, err, sizeof(err)));
+    ASSERT_TRUE(sqlite3_open(v2_path, &v2) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_prepare_v2(v2,
+        "SELECT (SELECT user_version FROM pragma_user_version),"
+        "(SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='transactions'),"
+        "(SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='accounts')",
+        -1, &foreign_check, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_step(foreign_check) == SQLITE_ROW);
+    ASSERT_EQ_I64(2, sqlite3_column_int(foreign_check, 0));
+    ASSERT_EQ_I64(1, sqlite3_column_int(foreign_check, 1));
+    ASSERT_EQ_I64(0, sqlite3_column_int(foreign_check, 2));
+    ASSERT_TRUE(sqlite3_finalize(foreign_check) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_exec(v2, "UPDATE transactions SET amount_cents=1250 WHERE id=41",
+                             NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_close(v2) == SQLITE_OK);
+    ASSERT_TRUE(cmny_db_open(&db, v2_path, false, NULL, currency, err, sizeof(err)));
     ASSERT_TRUE(sqlite3_prepare_v2(db.handle, "PRAGMA user_version", -1, &foreign_check, NULL) == SQLITE_OK);
     ASSERT_TRUE(sqlite3_step(foreign_check) == SQLITE_ROW);
     schema_version = sqlite3_column_int(foreign_check, 0);
-    ASSERT_EQ_I64(2, schema_version);
+    ASSERT_EQ_I64(5, schema_version);
+    ASSERT_TRUE(sqlite3_finalize(foreign_check) == SQLITE_OK);
+    ASSERT_TRUE(cmny_db_month_summary(&db, "2026-08", &summary, err, sizeof(err)));
+    ASSERT_EQ_I64(9900, summary.income_cents);
+    ASSERT_EQ_I64(1250, summary.expense_cents);
+    ASSERT_EQ_I64(2, summary.transaction_count);
+    ASSERT_TRUE(cmny_db_check(&db, err, sizeof(err)));
+    cmny_db_close(&db);
+    ASSERT_TRUE(unlink(v2_path) == 0);
+
+    char v4_path[] = "build/cmny-v4-XXXXXX";
+    int v4_descriptor = mkstemp(v4_path);
+    ASSERT_TRUE(v4_descriptor >= 0);
+    ASSERT_TRUE(close(v4_descriptor) == 0);
+    ASSERT_TRUE(cmny_db_open(&db, v4_path, false, "EUR", currency, err, sizeof(err)));
+    cmny_db_close(&db);
+    sqlite3 *v4 = NULL;
+    ASSERT_TRUE(sqlite3_open(v4_path, &v4) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_exec(v4,
+        "DROP TABLE import_records;DROP TABLE import_batches;"
+        "DROP TABLE categorization_rules;DROP TABLE import_profiles;"
+        "PRAGMA user_version=4;CREATE TABLE categorization_rules(id INTEGER)",
+        NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_close(v4) == SQLITE_OK);
+    ASSERT_TRUE(!cmny_db_open(&db, v4_path, false, NULL, currency, err, sizeof(err)));
+    ASSERT_TRUE(sqlite3_open(v4_path, &v4) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_prepare_v2(v4,
+        "SELECT (SELECT user_version FROM pragma_user_version),"
+        "(SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='import_profiles')",
+        -1, &foreign_check, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_step(foreign_check) == SQLITE_ROW);
+    ASSERT_EQ_I64(4, sqlite3_column_int(foreign_check, 0));
+    ASSERT_EQ_I64(0, sqlite3_column_int(foreign_check, 1));
+    ASSERT_TRUE(sqlite3_finalize(foreign_check) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_exec(v4, "DROP TABLE categorization_rules", NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_close(v4) == SQLITE_OK);
+    ASSERT_TRUE(cmny_db_open(&db, v4_path, false, NULL, currency, err, sizeof(err)));
+    ASSERT_TRUE(cmny_db_check(&db, err, sizeof(err)));
+    ASSERT_TRUE(sqlite3_prepare_v2(db.handle, "PRAGMA user_version", -1,
+                                   &foreign_check, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_step(foreign_check) == SQLITE_ROW);
+    ASSERT_EQ_I64(5, sqlite3_column_int(foreign_check, 0));
     ASSERT_TRUE(sqlite3_finalize(foreign_check) == SQLITE_OK);
     cmny_db_close(&db);
+    ASSERT_TRUE(unlink(v4_path) == 0);
 
     sqlite3 *corrupt = NULL;
     ASSERT_TRUE(sqlite3_open(path, &corrupt) == SQLITE_OK);

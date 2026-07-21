@@ -127,7 +127,9 @@ bool cmny_theme_parse(const char *input, CmnyTheme *theme) {
 }
 
 const char *cmny_theme_name(CmnyTheme theme) {
-    static const char *names[] = {"ocean", "violet", "amber"};
+    static const char *names[] = {
+        "ocean", "violet", "amber", "high-contrast", "monochrome"
+    };
     return theme >= CMNY_THEME_OCEAN && theme < CMNY_THEME_COUNT ? names[theme] : "unknown";
 }
 

@@ -92,7 +92,17 @@ static void test_themes(void) {
     ASSERT_TRUE(cmny_theme_parse("violet", &theme));
     ASSERT_EQ_I64(CMNY_THEME_VIOLET, theme);
     ASSERT_TRUE(strcmp(cmny_theme_name(CMNY_THEME_AMBER), "amber") == 0);
+    ASSERT_TRUE(cmny_theme_parse("high-contrast", &theme));
+    ASSERT_EQ_I64(CMNY_THEME_HIGH_CONTRAST, theme);
+    ASSERT_TRUE(cmny_theme_parse("monochrome", &theme));
+    ASSERT_EQ_I64(CMNY_THEME_MONOCHROME, theme);
+    ASSERT_TRUE(strcmp(cmny_theme_name(CMNY_THEME_OCEAN), "ocean") == 0);
+    ASSERT_TRUE(strcmp(cmny_theme_name(CMNY_THEME_VIOLET), "violet") == 0);
+    ASSERT_TRUE(strcmp(cmny_theme_name(CMNY_THEME_HIGH_CONTRAST), "high-contrast") == 0);
+    ASSERT_TRUE(strcmp(cmny_theme_name(CMNY_THEME_MONOCHROME), "monochrome") == 0);
+    ASSERT_TRUE(strcmp(cmny_theme_name(CMNY_THEME_COUNT), "unknown") == 0);
     ASSERT_TRUE(!cmny_theme_parse("neon", &theme));
+    ASSERT_EQ_I64(CMNY_THEME_MONOCHROME, theme);
 }
 
 int main(void) {

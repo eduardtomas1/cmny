@@ -1,4 +1,5 @@
 #include "cmny.h"
+#include "cmny_csv_parser.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -18,12 +19,34 @@
 #define cmny_fdopen fdopen
 #endif
 
-#define CSV_FIELDS 5
-#define CSV_FIELD_SIZE (CMNY_NOTE_MAX + 1)
+#define CSV_FIELDS 5U
 #define CSV_IMPORT_LIMIT 1000000U
+#define CSV_IMPORT_MAX_BYTES (512U * 1024U * 1024U)
+
+typedef struct {
+    FILE *file;
+    int error_number;
+} CsvFileReader;
+
+typedef struct {
+    CmnyDb *db;
+    bool apply;
+    bool saw_header;
+    bool failed;
+    CmnyImportPreview result;
+    char *err;
+    size_t err_size;
+} CsvImportContext;
 
 static void csv_error(char *err, size_t err_size, const char *message) {
     if (err != NULL && err_size > 0) (void)snprintf(err, err_size, "%s", message);
+}
+
+static void csv_errno_error(char *err, size_t err_size, const char *prefix,
+                            int error_number) {
+    if (err != NULL && err_size > 0) {
+        (void)snprintf(err, err_size, "%s: %s", prefix, strerror(error_number));
+    }
 }
 
 static FILE *create_exclusive(const char *path) {
@@ -39,12 +62,18 @@ static FILE *create_exclusive(const char *path) {
 #endif
     if (descriptor < 0) return NULL;
     FILE *file = cmny_fdopen(descriptor, "wb");
-    if (file == NULL) (void)cmny_close(descriptor);
+    if (file == NULL) {
+        int saved_errno = errno;
+        (void)cmny_close(descriptor);
+        (void)remove(path);
+        errno = saved_errno;
+    }
     return file;
 }
 
 static bool write_field(FILE *file, const char *value) {
-    bool quote = strchr(value, ',') != NULL || strchr(value, '"') != NULL;
+    bool quote = strchr(value, ',') != NULL || strchr(value, '"') != NULL ||
+                 strchr(value, '\r') != NULL || strchr(value, '\n') != NULL;
     if (quote && fputc('"', file) == EOF) return false;
     for (const char *cursor = value; *cursor != '\0'; cursor++) {
         if (*cursor == '"' && fputc('"', file) == EOF) return false;
@@ -76,7 +105,7 @@ bool cmny_csv_export(CmnyDb *db, const char *path, size_t *count,
     }
     FILE *file = create_exclusive(path);
     if (file == NULL) {
-        (void)snprintf(err, err_size, "cannot create export (choose a new path): %s", strerror(errno));
+        csv_errno_error(err, err_size, "cannot create export (choose a new path)", errno);
         return false;
     }
     bool ok = fputs("kind,amount,category,note,date\n", file) >= 0;
@@ -86,8 +115,10 @@ bool cmny_csv_export(CmnyDb *db, const char *path, size_t *count,
         "ORDER BY occurred_on,id", -1, &stmt, NULL);
     size_t rows = 0;
     if (rc != SQLITE_OK) {
-        (void)snprintf(err, err_size, "cannot read ledger for export: %s",
-                       sqlite3_errmsg(db->handle));
+        if (err != NULL && err_size > 0) {
+            (void)snprintf(err, err_size, "cannot read ledger for export: %s",
+                           sqlite3_errmsg(db->handle));
+        }
         ok = false;
     }
     while (ok && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
@@ -113,14 +144,23 @@ bool cmny_csv_export(CmnyDb *db, const char *path, size_t *count,
         rows++;
     }
     if (rc != SQLITE_DONE && ok) {
-        (void)snprintf(err, err_size, "cannot read ledger for export: %s", sqlite3_errmsg(db->handle));
+        if (err != NULL && err_size > 0) {
+            (void)snprintf(err, err_size, "cannot read ledger for export: %s",
+                           sqlite3_errmsg(db->handle));
+        }
         ok = false;
     }
-    (void)sqlite3_finalize(stmt);
+    int finalize_rc = sqlite3_finalize(stmt);
+    if (ok && finalize_rc != SQLITE_OK) {
+        csv_error(err, err_size, "cannot finish reading ledger for export");
+        ok = false;
+    }
     if (ok && fflush(file) != 0) ok = false;
     if (fclose(file) != 0) ok = false;
     if (!ok) {
-        if (err != NULL && err_size > 0 && err[0] == '\0') csv_error(err, err_size, "cannot write export");
+        if (err != NULL && err_size > 0 && err[0] == '\0') {
+            csv_error(err, err_size, "cannot write export");
+        }
         (void)remove(path);
         return false;
     }
@@ -128,63 +168,124 @@ bool cmny_csv_export(CmnyDb *db, const char *path, size_t *count,
     return true;
 }
 
-static bool parse_csv_line(char *line, char fields[CSV_FIELDS][CSV_FIELD_SIZE]) {
-    size_t length = strlen(line);
-    while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r')) {
-        line[--length] = '\0';
+static CmnyCsvReadStatus file_read(void *context, unsigned char *buffer,
+                                   size_t capacity, size_t *length) {
+    CsvFileReader *reader = context;
+    errno = 0;
+    size_t amount = fread(buffer, 1, capacity, reader->file);
+    if (amount > 0) {
+        *length = amount;
+        return CMNY_CSV_READ_DATA;
     }
-    const char *cursor = line;
-    for (size_t field = 0; field < CSV_FIELDS; field++) {
-        size_t used = 0;
-        bool quoted = *cursor == '"';
-        if (quoted) cursor++;
-        for (;;) {
-            if (*cursor == '\0') {
-                if (quoted || field + 1 != CSV_FIELDS) return false;
-                break;
-            }
-            if (quoted && *cursor == '"') {
-                if (cursor[1] == '"') {
-                    if (used + 1 >= CSV_FIELD_SIZE) return false;
-                    fields[field][used++] = '"';
-                    cursor += 2;
-                    continue;
-                }
-                cursor++;
-                if (field + 1 == CSV_FIELDS) {
-                    if (*cursor != '\0') return false;
-                } else if (*cursor++ != ',') {
-                    return false;
-                }
-                break;
-            }
-            if (!quoted && *cursor == ',') {
-                if (field + 1 == CSV_FIELDS) return false;
-                cursor++;
-                break;
-            }
-            if (!quoted && *cursor == '"') return false;
-            if (used + 1 >= CSV_FIELD_SIZE) return false;
-            fields[field][used++] = *cursor++;
-        }
-        fields[field][used] = '\0';
+    *length = 0;
+    if (ferror(reader->file)) {
+        reader->error_number = errno != 0 ? errno : EIO;
+        return CMNY_CSV_READ_ERROR;
     }
-    return *cursor == '\0';
+    if (feof(reader->file)) return CMNY_CSV_READ_END;
+    reader->error_number = EIO;
+    return CMNY_CSV_READ_ERROR;
 }
 
-static bool read_transaction(char *line, CmnyTransaction *tx) {
-    char fields[CSV_FIELDS][CSV_FIELD_SIZE] = {{0}};
-    if (!parse_csv_line(line, fields)) return false;
-    if (strcmp(fields[0], "expense") == 0) tx->kind = CMNY_EXPENSE;
-    else if (strcmp(fields[0], "income") == 0) tx->kind = CMNY_INCOME;
+static void record_error(CsvImportContext *context, const CmnyCsvRecord *record,
+                         const char *message) {
+    context->failed = true;
+    if (context->err != NULL && context->err_size > 0) {
+        (void)snprintf(context->err, context->err_size,
+                       "invalid CSV row %zu (record %zu, physical line %zu): %s",
+                       record->record_number, record->record_number,
+                       record->physical_line_start, message);
+    }
+}
+
+static bool header_valid(const CmnyCsvRecord *record) {
+    static const char *expected[CSV_FIELDS] = {
+        "kind", "amount", "category", "note", "date"
+    };
+    if (record->field_count != CSV_FIELDS) return false;
+    for (size_t field = 0; field < CSV_FIELDS; field++) {
+        if (strcmp(record->fields[field], expected[field]) != 0) return false;
+    }
+    return true;
+}
+
+static bool transaction_from_record(const CmnyCsvRecord *record, CmnyTransaction *tx) {
+    if (record->field_count != CSV_FIELDS) return false;
+    if (strcmp(record->fields[0], "expense") == 0) tx->kind = CMNY_EXPENSE;
+    else if (strcmp(record->fields[0], "income") == 0) tx->kind = CMNY_INCOME;
     else return false;
-    if (!cmny_money_parse(fields[1], &tx->amount_cents)) return false;
-    if (strlen(fields[2]) > CMNY_CATEGORY_MAX || strlen(fields[3]) > CMNY_NOTE_MAX ||
-        strlen(fields[4]) != 10) return false;
-    (void)snprintf(tx->category, sizeof(tx->category), "%s", fields[2]);
-    (void)snprintf(tx->note, sizeof(tx->note), "%s", fields[3]);
-    (void)snprintf(tx->occurred_on, sizeof(tx->occurred_on), "%s", fields[4]);
+    if (!cmny_money_parse(record->fields[1], &tx->amount_cents)) return false;
+    if (strlen(record->fields[2]) > CMNY_CATEGORY_MAX ||
+        strlen(record->fields[3]) > CMNY_NOTE_MAX || strlen(record->fields[4]) != 10) {
+        return false;
+    }
+    (void)snprintf(tx->category, sizeof(tx->category), "%s", record->fields[2]);
+    (void)snprintf(tx->note, sizeof(tx->note), "%s", record->fields[3]);
+    (void)snprintf(tx->occurred_on, sizeof(tx->occurred_on), "%s", record->fields[4]);
     return cmny_transaction_valid(tx, false);
+}
+
+static CmnyCsvVisitResult import_record(const CmnyCsvRecord *record, void *opaque) {
+    CsvImportContext *context = opaque;
+    if (!context->saw_header) {
+        context->saw_header = true;
+        if (!header_valid(record)) {
+            context->failed = true;
+            if (context->err != NULL && context->err_size > 0) {
+                (void)snprintf(context->err, context->err_size,
+                               "CSV header must be kind,amount,category,note,date "
+                               "(record %zu, physical line %zu)",
+                               record->record_number, record->physical_line_start);
+            }
+            return CMNY_CSV_VISIT_ERROR;
+        }
+        return CMNY_CSV_VISIT_CONTINUE;
+    }
+
+    if (context->result.transaction_count >= CSV_IMPORT_LIMIT) {
+        record_error(context, record,
+                     "CSV exceeds the 1,000,000 transaction import limit");
+        return CMNY_CSV_VISIT_ERROR;
+    }
+    CmnyTransaction tx = {0};
+    if (!transaction_from_record(record, &tx)) {
+        record_error(context, record, "invalid transaction data");
+        return CMNY_CSV_VISIT_ERROR;
+    }
+    int64_t *total = tx.kind == CMNY_INCOME ? &context->result.income_cents
+                                             : &context->result.expense_cents;
+    if (*total > INT64_MAX - tx.amount_cents) {
+        record_error(context, record, "transaction total exceeds the supported range");
+        return CMNY_CSV_VISIT_ERROR;
+    }
+    if (context->apply) {
+        char db_error[256] = {0};
+        if (!cmny_db_add(context->db, &tx, NULL, db_error, sizeof(db_error))) {
+            record_error(context, record,
+                         db_error[0] != '\0' ? db_error : "cannot save transaction");
+            return CMNY_CSV_VISIT_ERROR;
+        }
+    }
+    context->result.transaction_count++;
+    *total += tx.amount_cents;
+    return CMNY_CSV_VISIT_CONTINUE;
+}
+
+static void parser_error(char *err, size_t err_size,
+                         const CmnyCsvParseError *parse_error,
+                         const CsvFileReader *reader) {
+    if (err == NULL || err_size == 0) return;
+    if (reader->error_number != 0) {
+        (void)snprintf(err, err_size,
+                       "cannot read import file at record %zu, physical line %zu: %s",
+                       parse_error->record_number, parse_error->physical_line,
+                       strerror(reader->error_number));
+        return;
+    }
+    (void)snprintf(err, err_size,
+                   "invalid CSV syntax at record %zu, physical line %zu: %s",
+                   parse_error->record_number, parse_error->physical_line,
+                   parse_error->message != NULL ? parse_error->message : "parse failed");
 }
 
 bool cmny_csv_import(CmnyDb *db, const char *path, bool apply,
@@ -196,61 +297,68 @@ bool cmny_csv_import(CmnyDb *db, const char *path, bool apply,
     }
     FILE *file = fopen(path, "rb");
     if (file == NULL) {
-        (void)snprintf(err, err_size, "cannot open import: %s", strerror(errno));
+        csv_errno_error(err, err_size, "cannot open import", errno);
         return false;
     }
-    char line[1024];
-    char header[CSV_FIELDS][CSV_FIELD_SIZE] = {{0}};
-    bool ok = fgets(line, sizeof(line), file) != NULL && strchr(line, '\n') != NULL &&
-              parse_csv_line(line, header) && strcmp(header[0], "kind") == 0 &&
-              strcmp(header[1], "amount") == 0 && strcmp(header[2], "category") == 0 &&
-              strcmp(header[3], "note") == 0 && strcmp(header[4], "date") == 0;
-    if (!ok) csv_error(err, err_size, "CSV header must be kind,amount,category,note,date");
-    CmnyImportPreview result = {0};
-    if (ok && apply && sqlite3_exec(db->handle, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
-        (void)snprintf(err, err_size, "cannot start import: %s", sqlite3_errmsg(db->handle));
-        ok = false;
-    }
-    size_t line_number = 1;
-    while (ok && fgets(line, sizeof(line), file) != NULL) {
-        line_number++;
-        if (strchr(line, '\n') == NULL && !feof(file)) {
+
+    bool transaction_started = false;
+    bool ok = true;
+    if (apply) {
+        int rc = sqlite3_exec(db->handle, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+        if (rc != SQLITE_OK) {
+            if (err != NULL && err_size > 0) {
+                (void)snprintf(err, err_size, "cannot start import: %s",
+                               sqlite3_errmsg(db->handle));
+            }
             ok = false;
         } else {
-            CmnyTransaction tx = {0};
-            ok = read_transaction(line, &tx);
-            if (ok && result.transaction_count >= CSV_IMPORT_LIMIT) {
-                csv_error(err, err_size, "CSV exceeds the 1,000,000 transaction import limit");
+            transaction_started = true;
+        }
+    }
+
+    CsvFileReader reader = {.file = file};
+    CsvImportContext context = {
+        .db = db,
+        .apply = apply,
+        .err = err,
+        .err_size = err_size,
+    };
+    CmnyCsvParseError parse_error = {0};
+    CmnyCsvLimits limits;
+    cmny_csv_limits_default(&limits);
+    limits.max_bytes = CSV_IMPORT_MAX_BYTES;
+    limits.max_records = CSV_IMPORT_LIMIT + 2U;
+    limits.max_fields = CMNY_CSV_MAX_FIELDS;
+    limits.max_field_bytes = CMNY_NOTE_MAX;
+    if (ok && !cmny_csv_parse_stream(file_read, &reader, ',', &limits,
+                                      import_record, &context, &parse_error)) {
+        ok = false;
+        if (!context.failed) parser_error(err, err_size, &parse_error, &reader);
+    }
+    if (ok && !context.saw_header) {
+        csv_error(err, err_size, "CSV header must be kind,amount,category,note,date "
+                                "(record 1, physical line 1)");
+        ok = false;
+    }
+    if (fclose(file) != 0) {
+        if (ok) csv_errno_error(err, err_size, "cannot finish reading import file", errno);
+        ok = false;
+    }
+
+    if (transaction_started) {
+        if (ok) {
+            int rc = sqlite3_exec(db->handle, "COMMIT", NULL, NULL, NULL);
+            if (rc != SQLITE_OK) {
+                if (err != NULL && err_size > 0) {
+                    (void)snprintf(err, err_size, "cannot commit import: %s",
+                                   sqlite3_errmsg(db->handle));
+                }
                 ok = false;
             }
-            int64_t *total = tx.kind == CMNY_INCOME ? &result.income_cents : &result.expense_cents;
-            if (ok && *total > INT64_MAX - tx.amount_cents) ok = false;
-            if (ok) {
-                result.transaction_count++;
-                *total += tx.amount_cents;
-                if (apply) ok = cmny_db_add(db, &tx, NULL, err, err_size);
-            }
-        }
-        if (!ok && err != NULL && err_size > 0 && err[0] == '\0') {
-            (void)snprintf(err, err_size, "invalid CSV row %zu", line_number);
-        }
-    }
-    if (ferror(file)) {
-        csv_error(err, err_size, "cannot read import file");
-        ok = false;
-    }
-    if (fclose(file) != 0 && ok) {
-        csv_error(err, err_size, "cannot finish reading import file");
-        ok = false;
-    }
-    if (apply) {
-        if (ok && sqlite3_exec(db->handle, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
-            (void)snprintf(err, err_size, "cannot commit import: %s", sqlite3_errmsg(db->handle));
-            ok = false;
         }
         if (!ok) (void)sqlite3_exec(db->handle, "ROLLBACK", NULL, NULL, NULL);
     }
     if (!ok) return false;
-    *preview = result;
+    *preview = context.result;
     return true;
 }

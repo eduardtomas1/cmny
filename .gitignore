@@ -29,6 +29,8 @@ compile_commands.json
 *.sqlite-wal
 *.backup
 *.backup-*
+*.auto-backup-*
+*.auto-backup-partial-*
 *.before-restore-*
 
 # Test, sanitizer, profiler, and coverage output
@@ -49,6 +51,7 @@ coverage.xml
 /core
 /core.*
 vgcore.*
+/*.plist
 
 # Python helper caches
 __pycache__/

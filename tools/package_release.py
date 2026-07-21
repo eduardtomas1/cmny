@@ -14,22 +14,19 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.3.1"
 ZIG_VERSION = "0.15.2"
 SQLITE_NUMBER = "3530300"
 SQLITE_VERSION = "3.53.3"
 PDCURSES_VERSION = "4.5.3"
 
 ROOT = Path(__file__).resolve().parents[1]
+VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
 BUILD = ROOT / "build" / "release"
 CACHE = ROOT / "build" / "release-cache"
 STAGE = ROOT / "build" / "release-stage"
 DIST = ROOT / "dist"
 
-APP_SOURCES = [
-    ROOT / "src" / name
-    for name in ("main.c", "core.c", "paths.c", "db.c", "csv.c", "ui.c")
-]
+APP_SOURCES = sorted((ROOT / "src").rglob("*.c"))
 PDC_COMMON = """
 addch addchstr addstr attr beep bkgd border clear color debug delch deleteln
 getch getstr getyx inch inchstr initscr inopts insch insstr instr kernel
@@ -41,7 +38,7 @@ PDC_PLATFORM = "pdcclip pdcdisp pdcgetsc pdckbd pdcscrn pdcsetsc pdcutil".split(
 APP_FLAGS = [
     "-O2", "-std=c17", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra",
     "-Wpedantic", "-Wshadow", "-Wconversion", "-Wstrict-prototypes",
-    "-Wmissing-prototypes", "-Wformat=2",
+    "-Wmissing-prototypes", "-Wformat=2", f'-DCMNY_VERSION="{VERSION}"',
 ]
 SQLITE_FLAGS = [
     "-O2", "-DSQLITE_THREADSAFE=0", "-DSQLITE_OMIT_LOAD_EXTENSION", "-DSQLITE_DQS=0",
@@ -163,9 +160,10 @@ def compile_cross(zig: Path, sqlite: Path, pdc: Path, target: str, backend: str,
     library = compile_pdc(zig, pdc, target, backend, output)
     objects: list[Path] = []
     includes = [f"-I{ROOT / 'include'}", f"-I{sqlite}", f"-I{pdc}"]
-    pdc_flags = ["-DPDC_WIDE", "-DPDC_FORCE_UTF8"]
+    pdc_flags = ["-DPDC_WIDE", "-DPDC_FORCE_UTF8", "-DPDC_NCMOUSE"]
     for source in APP_SOURCES:
-        obj = output / f"{source.stem}.o"
+        relative = source.relative_to(ROOT / "src").with_suffix("")
+        obj = output / ("_".join(relative.parts) + ".o")
         run(zig, "cc", "-target", target, *APP_FLAGS, *pdc_flags, *includes,
             "-c", source, "-o", obj)
         objects.append(obj)
@@ -190,7 +188,8 @@ def compile_macos(sqlite: Path, executable: Path) -> None:
         arch_flags = ["-arch", arch, "-mmacosx-version-min=11.0"]
         includes = [f"-I{ROOT / 'include'}", f"-I{sqlite}"]
         for source in APP_SOURCES:
-            obj = output / f"{source.stem}.o"
+            relative = source.relative_to(ROOT / "src").with_suffix("")
+            obj = output / ("_".join(relative.parts) + ".o")
             run("clang", *arch_flags, *APP_FLAGS, *includes, "-c", source, "-o", obj)
             objects.append(obj)
         sqlite_object = output / "sqlite3.o"
@@ -220,7 +219,7 @@ def stage_package(platform_name: str, binary: Path) -> Path:
     binary_name = "cmny.exe" if platform_name.startswith("windows") else "cmny"
     shutil.copy2(binary, directory / binary_name)
     os.chmod(directory / binary_name, 0o755)
-    for name in ("README.md", "LICENSE"):
+    for name in ("README.md", "LICENSE", "VERSION"):
         shutil.copy2(ROOT / name, directory / name)
     shutil.copytree(ROOT / "assets", directory / "assets", dirs_exist_ok=True)
     (directory / "THIRD_PARTY_NOTICES.txt").write_text(

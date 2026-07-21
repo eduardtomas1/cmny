@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-VERSION = "0.3.1"
+VERSION = (ROOT / "VERSION").read_text(encoding="ascii").strip()
 PACKAGES = {
     f"cmny-v{VERSION}-macos-universal.tar.gz": "macos",
     f"cmny-v{VERSION}-linux-x86_64.tar.gz": "linux",
@@ -79,11 +79,13 @@ def main() -> None:
                 raise AssertionError(f"unexpected archive layout for {name}")
             root = roots[0]
             binary = root / ("cmny.exe" if kind == "windows" else "cmny")
-            for required in (binary, root / "README.md", root / "LICENSE",
+            for required in (binary, root / "README.md", root / "LICENSE", root / "VERSION",
                              root / "assets" / "logo.svg",
                              root / "assets" / "screenshots" / "overview.svg",
-                             root / "assets" / "screenshots" / "reports.svg",
-                             root / "assets" / "screenshots" / "settings.svg",
+                             root / "assets" / "screenshots" / "activity.svg",
+                             root / "assets" / "screenshots" / "plan.svg",
+                             root / "assets" / "screenshots" / "insights.svg",
+                             root / "assets" / "screenshots" / "manage.svg",
                              root / "THIRD_PARTY_NOTICES.txt", root / "INSTALL.txt"):
                 if not required.is_file():
                     raise AssertionError(f"missing {required.name} in {name}")
