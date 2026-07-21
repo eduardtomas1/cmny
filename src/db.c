@@ -1,14 +1,21 @@
 #include "cmny.h"
 
-#include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #define CMNY_APPLICATION_ID 1129139801
-#define CMNY_SCHEMA_VERSION 1
+#define CMNY_SCHEMA_VERSION 2
+
+static bool copy_column(char *out, size_t out_size, sqlite3_stmt *stmt, int column);
 
 static void set_error(char *err, size_t err_size, const char *message) {
     if (err != NULL && err_size > 0) {
@@ -85,7 +92,7 @@ static bool migrate(CmnyDb *db, char *err, size_t err_size) {
         set_error(err, err_size, "database schema is newer than this CMNY build");
         return false;
     }
-    if (version < CMNY_SCHEMA_VERSION) {
+    if (version < 1) {
         static const char *migration =
         "BEGIN IMMEDIATE;"
         "CREATE TABLE transactions ("
@@ -115,11 +122,43 @@ static bool migrate(CmnyDb *db, char *err, size_t err_size) {
             return false;
         }
     }
+    if (version < 2) {
+        static const char *migration =
+        "BEGIN IMMEDIATE;"
+        "CREATE TABLE budgets ("
+        " month TEXT NOT NULL CHECK(month GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]'"
+        "   AND date(month || '-01', '+0 days') = month || '-01'),"
+        " category TEXT NOT NULL CHECK(length(category) BETWEEN 1 AND 32"
+        "   AND category NOT GLOB '*[^ -~]*'),"
+        " limit_cents INTEGER NOT NULL CHECK(limit_cents > 0 AND limit_cents <= 9000000000000000),"
+        " PRIMARY KEY(month, category)"
+        ") STRICT;"
+        "CREATE TABLE recurring ("
+        " id INTEGER PRIMARY KEY,"
+        " kind INTEGER NOT NULL CHECK(kind IN (1, 2)),"
+        " amount_cents INTEGER NOT NULL CHECK(amount_cents > 0 AND amount_cents <= 9000000000000000),"
+        " category TEXT NOT NULL CHECK(length(category) BETWEEN 1 AND 32"
+        "   AND category NOT GLOB '*[^ -~]*'),"
+        " note TEXT NOT NULL DEFAULT '' CHECK(length(note) <= 120"
+        "   AND note NOT GLOB '*[^ -~]*'),"
+        " day_of_month INTEGER NOT NULL CHECK(day_of_month BETWEEN 1 AND 31),"
+        " created_at INTEGER NOT NULL DEFAULT(CAST(strftime('%s','now') AS INTEGER)),"
+        " UNIQUE(kind, amount_cents, category, note, day_of_month)"
+        ") STRICT;"
+        "PRAGMA user_version = 2;"
+        "COMMIT;";
+        if (!exec_sql(db, migration, err, err_size)) {
+            (void)sqlite3_exec(db->handle, "ROLLBACK", NULL, NULL, NULL);
+            return false;
+        }
+    }
 
     sqlite3_stmt *verify = NULL;
     rc = sqlite3_prepare_v2(db->handle,
-        "SELECT t.id, t.kind, t.amount_cents, t.category, t.note, t.occurred_on, s.key, s.value "
-        "FROM transactions AS t LEFT JOIN settings AS s ON 0 LIMIT 0", -1, &verify, NULL);
+        "SELECT t.id, t.kind, t.amount_cents, t.category, t.note, t.occurred_on, s.key, s.value, "
+        "b.month, b.category, b.limit_cents, r.id, r.day_of_month "
+        "FROM transactions AS t LEFT JOIN settings AS s ON 0 LEFT JOIN budgets AS b ON 0 "
+        "LEFT JOIN recurring AS r ON 0 LIMIT 0", -1, &verify, NULL);
     if (rc != SQLITE_OK) {
         set_db_error(db, err, err_size, "CMNY database schema is incomplete");
         (void)sqlite3_finalize(verify);
@@ -142,7 +181,10 @@ static bool ensure_currency(CmnyDb *db, const char *requested, char currency_out
     if (rc == SQLITE_ROW) {
         const unsigned char *stored = sqlite3_column_text(stmt, 0);
         char normalized[4] = {0};
-        bool valid = stored != NULL && cmny_currency_supported((const char *)stored, normalized) &&
+        int stored_size = sqlite3_column_bytes(stmt, 0);
+        bool valid = stored != NULL && stored_size == 3 &&
+                     memchr(stored, '\0', (size_t)stored_size) == NULL &&
+                     cmny_currency_supported((const char *)stored, normalized) &&
                      strcmp((const char *)stored, normalized) == 0;
         bool matches = valid && (requested == NULL || strcmp((const char *)stored, requested) == 0);
         if (valid) (void)snprintf(currency_out, 4, "%s", (const char *)stored);
@@ -175,6 +217,47 @@ static bool ensure_currency(CmnyDb *db, const char *requested, char currency_out
     if (!ok) set_db_error(db, err, err_size, "cannot store ledger currency");
     (void)sqlite3_finalize(stmt);
     if (ok) (void)snprintf(currency_out, 4, "%s", currency);
+    return ok;
+}
+
+bool cmny_db_setting_get(CmnyDb *db, const char *key, char *out, size_t out_size) {
+    if (db == NULL || db->handle == NULL || !cmny_text_valid(key, 32, false) ||
+        out == NULL || out_size == 0) return false;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, "SELECT value FROM settings WHERE key=?", -1,
+                                &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    bool ok = rc == SQLITE_ROW && sqlite3_column_text(stmt, 0) != NULL;
+    if (ok) {
+        const char *value = (const char *)sqlite3_column_text(stmt, 0);
+        int value_size = sqlite3_column_bytes(stmt, 0);
+        ok = value_size >= 0 && (size_t)value_size < out_size &&
+             memchr(value, '\0', (size_t)value_size) == NULL &&
+             strlen(value) == (size_t)value_size && cmny_text_valid(value, 120, true);
+        if (ok) (void)snprintf(out, out_size, "%s", value);
+    }
+    (void)sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool cmny_db_setting_set(CmnyDb *db, const char *key, const char *value,
+                         char *err, size_t err_size) {
+    if (db == NULL || db->handle == NULL || !cmny_text_valid(key, 32, false) ||
+        !cmny_text_valid(value, 120, true)) {
+        set_error(err, err_size, "invalid preference");
+        return false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle,
+        "INSERT INTO settings(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 2, value, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    bool ok = rc == SQLITE_DONE;
+    if (!ok) set_db_error(db, err, err_size, "cannot save preference");
+    (void)sqlite3_finalize(stmt);
     return ok;
 }
 
@@ -257,33 +340,279 @@ void cmny_db_close(CmnyDb *db) {
     }
 }
 
-static bool safe_text(const char *text, size_t maximum, bool allow_empty) {
-    if (text == NULL) {
+static bool copy_database(sqlite3 *destination, sqlite3 *source, char *err, size_t err_size) {
+    sqlite3_backup *backup = sqlite3_backup_init(destination, "main", source, "main");
+    if (backup == NULL) {
+        if (err != NULL && err_size > 0) {
+            (void)snprintf(err, err_size, "cannot start database copy: %s", sqlite3_errmsg(destination));
+        }
         return false;
     }
-    size_t len = strlen(text);
-    if (len > maximum || (!allow_empty && len == 0)) {
+    int rc = sqlite3_backup_step(backup, -1);
+    int finish_rc = sqlite3_backup_finish(backup);
+    if (rc != SQLITE_DONE || finish_rc != SQLITE_OK) {
+        if (err != NULL && err_size > 0) {
+            (void)snprintf(err, err_size, "cannot complete database copy: %s",
+                           sqlite3_errmsg(destination));
+        }
         return false;
     }
-    bool has_non_space = allow_empty;
-    for (size_t i = 0; i < len; i++) {
-        unsigned char ch = (unsigned char)text[i];
-        if (ch < 32 || ch > 126) {
-            return false;
+    return true;
+}
+
+static bool create_private_file(const char *path, char *err, size_t err_size) {
+#ifdef _WIN32
+    int descriptor = _open(path, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+                           _S_IREAD | _S_IWRITE);
+    if (descriptor >= 0) (void)_close(descriptor);
+#else
+    int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int descriptor = open(path, flags, 0600);
+    if (descriptor >= 0) (void)close(descriptor);
+#endif
+    if (descriptor >= 0) return true;
+    if (errno == EEXIST) {
+        set_error(err, err_size, "backup path already exists");
+    } else if (err != NULL && err_size > 0) {
+        (void)snprintf(err, err_size, "cannot create backup: %s", strerror(errno));
+    }
+    return false;
+}
+
+static void remove_backup_sidecars(const char *path) {
+    char sidecar[4200];
+    static const char *suffixes[] = {"-wal", "-shm"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        int written = snprintf(sidecar, sizeof(sidecar), "%s%s", path, suffixes[i]);
+        if (written >= 0 && (size_t)written < sizeof(sidecar)) (void)remove(sidecar);
+    }
+}
+
+bool cmny_db_backup(CmnyDb *db, const char *path, char *err, size_t err_size) {
+    if (err != NULL && err_size > 0) err[0] = '\0';
+    if (db == NULL || db->handle == NULL || path == NULL || *path == '\0') {
+        set_error(err, err_size, "invalid backup path");
+        return false;
+    }
+    if (!create_private_file(path, err, err_size)) return false;
+    int flags = SQLITE_OPEN_READWRITE;
+#ifdef SQLITE_OPEN_NOFOLLOW
+    flags |= SQLITE_OPEN_NOFOLLOW;
+#endif
+    sqlite3 *destination = NULL;
+    int rc = sqlite3_open_v2(path, &destination, flags, NULL);
+    bool ok = rc == SQLITE_OK && copy_database(destination, db->handle, err, err_size);
+    CmnyDb destination_db = {.handle = destination};
+    if (ok) {
+        ok = exec_sql(&destination_db, "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;",
+                      err, err_size);
+    }
+    if (rc != SQLITE_OK && err != NULL && err_size > 0) {
+        (void)snprintf(err, err_size, "cannot create backup: %s",
+                       destination != NULL ? sqlite3_errmsg(destination) : "open failed");
+    }
+    if (destination != NULL) (void)sqlite3_close(destination);
+    if (ok) remove_backup_sidecars(path);
+#ifndef _WIN32
+    if (ok && chmod(path, 0600) != 0) {
+        (void)snprintf(err, err_size, "cannot protect backup file: %s", strerror(errno));
+        ok = false;
+    }
+#endif
+    if (!ok) (void)remove(path);
+    return ok;
+}
+
+bool cmny_db_restore(CmnyDb *db, const char *path, char currency_out[4],
+                     char *err, size_t err_size) {
+    if (err != NULL && err_size > 0) err[0] = '\0';
+    if (db == NULL || db->handle == NULL || path == NULL || *path == '\0' ||
+        currency_out == NULL) {
+        set_error(err, err_size, "invalid restore path");
+        return false;
+    }
+    int flags = SQLITE_OPEN_READONLY;
+#ifdef SQLITE_OPEN_NOFOLLOW
+    flags |= SQLITE_OPEN_NOFOLLOW;
+#endif
+    sqlite3 *source_handle = NULL;
+    int rc = sqlite3_open_v2(path, &source_handle, flags, NULL);
+    if (rc != SQLITE_OK) {
+        (void)snprintf(err, err_size, "cannot open restore file: %s",
+                       source_handle != NULL ? sqlite3_errmsg(source_handle) : "open failed");
+        if (source_handle != NULL) (void)sqlite3_close(source_handle);
+        return false;
+    }
+    CmnyDb source = {.handle = source_handle};
+    (void)sqlite3_busy_timeout(source_handle, 3000);
+    if (!exec_sql(&source, "PRAGMA trusted_schema=OFF;", err, err_size)) {
+        (void)sqlite3_close(source_handle);
+        return false;
+    }
+#ifdef SQLITE_DBCONFIG_DEFENSIVE
+    if (sqlite3_db_config(source_handle, SQLITE_DBCONFIG_DEFENSIVE, 1, NULL) != SQLITE_OK) {
+        set_db_error(&source, err, err_size, "cannot inspect restore file safely");
+        (void)sqlite3_close(source_handle);
+        return false;
+    }
+#endif
+    int application_id = 0;
+    int version = 0;
+    bool ok = read_pragma_int(&source, "PRAGMA application_id", &application_id, err, err_size) &&
+              read_pragma_int(&source, "PRAGMA user_version", &version, err, err_size) &&
+              application_id == CMNY_APPLICATION_ID && version >= 1 && version <= CMNY_SCHEMA_VERSION &&
+              cmny_db_check(&source, err, err_size);
+    if (!ok && err != NULL && err_size > 0 && err[0] == '\0') {
+        set_error(err, err_size, "restore file is not a supported CMNY ledger");
+    }
+    if (ok) ok = copy_database(db->handle, source_handle, err, err_size);
+    (void)sqlite3_close(source_handle);
+    if (ok) ok = migrate(db, err, err_size);
+    if (ok) ok = ensure_currency(db, NULL, currency_out, err, err_size);
+    if (ok) ok = cmny_db_check(db, err, err_size);
+    if (ok) ok = exec_sql(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;", err, err_size);
+    return ok;
+}
+
+bool cmny_db_check(CmnyDb *db, char *err, size_t err_size) {
+    if (err != NULL && err_size > 0) err[0] = '\0';
+    if (db == NULL || db->handle == NULL) {
+        set_error(err, err_size, "database is not open");
+        return false;
+    }
+    int application_id = 0;
+    int version = 0;
+    if (!read_pragma_int(db, "PRAGMA application_id", &application_id, err, err_size) ||
+        !read_pragma_int(db, "PRAGMA user_version", &version, err, err_size) ||
+        application_id != CMNY_APPLICATION_ID || version < 1 || version > CMNY_SCHEMA_VERSION) {
+        if (err != NULL && err_size > 0 && err[0] == '\0') {
+            set_error(err, err_size, "ledger metadata is invalid");
         }
-        if (!isspace(ch)) {
-            has_non_space = true;
+        return false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, "PRAGMA quick_check", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    bool ok = rc == SQLITE_ROW && sqlite3_column_text(stmt, 0) != NULL &&
+              strcmp((const char *)sqlite3_column_text(stmt, 0), "ok") == 0 &&
+              sqlite3_step(stmt) == SQLITE_DONE;
+    (void)sqlite3_finalize(stmt);
+    if (!ok) {
+        set_error(err, err_size, "SQLite integrity check failed");
+        return false;
+    }
+
+    rc = sqlite3_prepare_v2(db->handle,
+        "SELECT id,kind,amount_cents,category,note,occurred_on FROM transactions", -1,
+        &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        (void)sqlite3_finalize(stmt);
+        set_db_error(db, err, err_size, "cannot inspect ledger transactions");
+        return false;
+    }
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        CmnyTransaction tx = {0};
+        tx.id = sqlite3_column_int64(stmt, 0);
+        tx.kind = (CmnyKind)sqlite3_column_int(stmt, 1);
+        tx.amount_cents = sqlite3_column_int64(stmt, 2);
+        bool text_ok = copy_column(tx.category, sizeof(tx.category), stmt, 3) &&
+                       copy_column(tx.note, sizeof(tx.note), stmt, 4) &&
+                       copy_column(tx.occurred_on, sizeof(tx.occurred_on), stmt, 5);
+        if (!text_ok || !cmny_transaction_valid(&tx, true)) {
+            rc = SQLITE_CORRUPT;
+            break;
         }
     }
-    return has_non_space;
+    ok = rc == SQLITE_DONE;
+    (void)sqlite3_finalize(stmt);
+    if (!ok) {
+        set_error(err, err_size, "ledger contains invalid transaction data");
+        return false;
+    }
+
+    rc = sqlite3_prepare_v2(db->handle, "SELECT key,value FROM settings", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        set_db_error(db, err, err_size, "cannot inspect ledger preferences");
+        (void)sqlite3_finalize(stmt);
+        return false;
+    }
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        char key[33], value[121];
+        bool text_ok = copy_column(key, sizeof(key), stmt, 0) &&
+                       copy_column(value, sizeof(value), stmt, 1);
+        if (!text_ok || !cmny_text_valid(key, 32, false) ||
+            !cmny_text_valid(value, 120, true)) {
+            rc = SQLITE_CORRUPT;
+            break;
+        }
+    }
+    ok = rc == SQLITE_DONE;
+    (void)sqlite3_finalize(stmt);
+    if (!ok) {
+        set_error(err, err_size, "ledger contains invalid preference data");
+        return false;
+    }
+    if (version < 2) return true;
+
+    rc = sqlite3_prepare_v2(db->handle,
+        "SELECT month,category,limit_cents FROM budgets", -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        set_db_error(db, err, err_size, "cannot inspect ledger budgets");
+        (void)sqlite3_finalize(stmt);
+        return false;
+    }
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        char month[8], category[CMNY_CATEGORY_MAX + 1];
+        bool text_ok = copy_column(month, sizeof(month), stmt, 0) &&
+                       copy_column(category, sizeof(category), stmt, 1);
+        int64_t limit = sqlite3_column_int64(stmt, 2);
+        if (!text_ok || !cmny_month_valid(month) ||
+            !cmny_text_valid(category, CMNY_CATEGORY_MAX, false) ||
+            limit <= 0 || limit > 9000000000000000LL) {
+            rc = SQLITE_CORRUPT;
+            break;
+        }
+    }
+    ok = rc == SQLITE_DONE;
+    (void)sqlite3_finalize(stmt);
+    if (!ok) {
+        set_error(err, err_size, "ledger contains invalid budget data");
+        return false;
+    }
+
+    rc = sqlite3_prepare_v2(db->handle,
+        "SELECT id,kind,amount_cents,category,note,day_of_month FROM recurring", -1,
+        &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        set_db_error(db, err, err_size, "cannot inspect recurring templates");
+        (void)sqlite3_finalize(stmt);
+        return false;
+    }
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        CmnyTransaction tx = {0};
+        tx.id = sqlite3_column_int64(stmt, 0);
+        tx.kind = (CmnyKind)sqlite3_column_int(stmt, 1);
+        tx.amount_cents = sqlite3_column_int64(stmt, 2);
+        bool text_ok = copy_column(tx.category, sizeof(tx.category), stmt, 3) &&
+                       copy_column(tx.note, sizeof(tx.note), stmt, 4);
+        int day = sqlite3_column_int(stmt, 5);
+        (void)snprintf(tx.occurred_on, sizeof(tx.occurred_on), "2000-01-%02d", day);
+        if (!text_ok || day < 1 || day > 31 || !cmny_transaction_valid(&tx, true)) {
+            rc = SQLITE_CORRUPT;
+            break;
+        }
+    }
+    ok = rc == SQLITE_DONE;
+    (void)sqlite3_finalize(stmt);
+    if (!ok) set_error(err, err_size, "ledger contains invalid recurring data");
+    return ok;
 }
 
 static bool valid_transaction(const CmnyTransaction *tx, bool require_id, char *err, size_t err_size) {
-    if (tx == NULL || (require_id && tx->id <= 0) ||
-        (tx->kind != CMNY_EXPENSE && tx->kind != CMNY_INCOME) || tx->amount_cents <= 0 ||
-        tx->amount_cents > 9000000000000000LL ||
-        !safe_text(tx->category, CMNY_CATEGORY_MAX, false) ||
-        !safe_text(tx->note, CMNY_NOTE_MAX, true) || !cmny_date_valid(tx->occurred_on)) {
+    if (!cmny_transaction_valid(tx, require_id)) {
         set_error(err, err_size, "invalid transaction data");
         return false;
     }
@@ -356,9 +685,34 @@ bool cmny_db_delete(CmnyDb *db, int64_t id, char *err, size_t err_size) {
     return ok;
 }
 
-static void copy_column(char *out, size_t out_size, sqlite3_stmt *stmt, int column) {
+static bool copy_column(char *out, size_t out_size, sqlite3_stmt *stmt, int column) {
+    if (out == NULL || out_size == 0) return false;
     const unsigned char *text = sqlite3_column_text(stmt, column);
-    (void)snprintf(out, out_size, "%s", text != NULL ? (const char *)text : "");
+    int bytes = sqlite3_column_bytes(stmt, column);
+    if (text == NULL || bytes < 0 || (size_t)bytes >= out_size ||
+        memchr(text, '\0', (size_t)bytes) != NULL) {
+        out[0] = '\0';
+        return false;
+    }
+    memcpy(out, text, (size_t)bytes);
+    out[bytes] = '\0';
+    return true;
+}
+
+static bool make_like_pattern(const char *search, char *out, size_t out_size) {
+    const char *input = search != NULL ? search : "";
+    size_t used = 0;
+    if (out_size < 3) return false;
+    out[used++] = '%';
+    while (*input != '\0') {
+        if ((*input == '%' || *input == '_' || *input == '\\') && used + 1 >= out_size) return false;
+        if (*input == '%' || *input == '_' || *input == '\\') out[used++] = '\\';
+        if (used + 1 >= out_size) return false;
+        out[used++] = *input++;
+    }
+    out[used++] = '%';
+    out[used] = '\0';
+    return true;
 }
 
 bool cmny_db_list(CmnyDb *db, const char *month, const char *search, int kind_filter,
@@ -375,26 +729,31 @@ bool cmny_db_list(CmnyDb *db, const char *month, const char *search, int kind_fi
     }
     char start[11];
     char end[11];
-    char pattern[CMNY_NOTE_MAX + CMNY_CATEGORY_MAX + 8];
+    char pattern[(CMNY_NOTE_MAX + 1) * 2 + 3];
+    bool all_months = search != NULL && *search != '\0';
     (void)snprintf(start, sizeof(start), "%s-01", month);
     (void)snprintf(end, sizeof(end), "%s-01", next_month);
-    (void)snprintf(pattern, sizeof(pattern), "%%%s%%", search != NULL ? search : "");
+    if (!make_like_pattern(search, pattern, sizeof(pattern))) {
+        set_error(err, err_size, "search text is too long");
+        return false;
+    }
 
     static const char *sql =
         "SELECT id, kind, amount_cents, category, note, occurred_on FROM transactions "
-        "WHERE occurred_on>=? AND occurred_on<? AND (?=0 OR kind=?) "
+        "WHERE (?=1 OR (occurred_on>=? AND occurred_on<?)) AND (?=0 OR kind=?) "
         "AND (category LIKE ? ESCAPE '\\' OR note LIKE ? ESCAPE '\\') "
         "ORDER BY occurred_on DESC, id DESC LIMIT ? OFFSET ?";
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, start, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 2, end, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 3, kind_filter);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 1, all_months ? 1 : 0);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 2, start, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 3, end, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 4, kind_filter);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 5, pattern, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 5, kind_filter);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 6, pattern, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 7, (sqlite3_int64)cap);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 8, (sqlite3_int64)offset);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 7, pattern, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 8, (sqlite3_int64)cap);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 9, (sqlite3_int64)offset);
     if (rc != SQLITE_OK) {
         set_db_error(db, err, err_size, "cannot prepare transaction query");
         (void)sqlite3_finalize(stmt);
@@ -406,10 +765,10 @@ bool cmny_db_list(CmnyDb *db, const char *month, const char *search, int kind_fi
         out[used].id = sqlite3_column_int64(stmt, 0);
         out[used].kind = (CmnyKind)sqlite3_column_int(stmt, 1);
         out[used].amount_cents = sqlite3_column_int64(stmt, 2);
-        copy_column(out[used].category, sizeof(out[used].category), stmt, 3);
-        copy_column(out[used].note, sizeof(out[used].note), stmt, 4);
-        copy_column(out[used].occurred_on, sizeof(out[used].occurred_on), stmt, 5);
-        if (!valid_transaction(&out[used], true, err, err_size)) {
+        bool text_ok = copy_column(out[used].category, sizeof(out[used].category), stmt, 3) &&
+                       copy_column(out[used].note, sizeof(out[used].note), stmt, 4) &&
+                       copy_column(out[used].occurred_on, sizeof(out[used].occurred_on), stmt, 5);
+        if (!text_ok || !valid_transaction(&out[used], true, err, err_size)) {
             set_error(err, err_size, "database contains invalid transaction data");
             (void)sqlite3_finalize(stmt);
             *count = used;
@@ -433,25 +792,30 @@ bool cmny_db_count(CmnyDb *db, const char *month, const char *search, int kind_f
         return false;
     }
     char next_month[8], start[11], end[11];
-    char pattern[CMNY_NOTE_MAX + CMNY_CATEGORY_MAX + 8];
+    char pattern[(CMNY_NOTE_MAX + 1) * 2 + 3];
+    bool all_months = search != NULL && *search != '\0';
     if (!cmny_month_shift(month, 1, next_month)) {
         set_error(err, err_size, "invalid month range");
         return false;
     }
     (void)snprintf(start, sizeof(start), "%s-01", month);
     (void)snprintf(end, sizeof(end), "%s-01", next_month);
-    (void)snprintf(pattern, sizeof(pattern), "%%%s%%", search != NULL ? search : "");
+    if (!make_like_pattern(search, pattern, sizeof(pattern))) {
+        set_error(err, err_size, "search text is too long");
+        return false;
+    }
     static const char *sql =
-        "SELECT COUNT(*) FROM transactions WHERE occurred_on>=? AND occurred_on<? "
+        "SELECT COUNT(*) FROM transactions WHERE (?=1 OR (occurred_on>=? AND occurred_on<?)) "
         "AND (?=0 OR kind=?) AND (category LIKE ? ESCAPE '\\' OR note LIKE ? ESCAPE '\\')";
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, start, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 2, end, -1, SQLITE_TRANSIENT);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 3, kind_filter);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 1, all_months ? 1 : 0);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 2, start, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 3, end, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 4, kind_filter);
-    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 5, pattern, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 5, kind_filter);
     if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 6, pattern, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 7, pattern, -1, SQLITE_TRANSIENT);
     if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
     bool ok = rc == SQLITE_ROW;
     if (ok) {
@@ -539,9 +903,9 @@ bool cmny_db_category_totals(CmnyDb *db, const char *month, CmnyCategoryTotal *o
     }
     size_t used = 0;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW && used < cap) {
-        copy_column(out[used].category, sizeof(out[used].category), stmt, 0);
+        bool text_ok = copy_column(out[used].category, sizeof(out[used].category), stmt, 0);
         out[used].amount_cents = sqlite3_column_int64(stmt, 1);
-        if (!safe_text(out[used].category, CMNY_CATEGORY_MAX, false) ||
+        if (!text_ok || !cmny_text_valid(out[used].category, CMNY_CATEGORY_MAX, false) ||
             out[used].amount_cents <= 0) {
             set_error(err, err_size, "database contains invalid category totals");
             (void)sqlite3_finalize(stmt);
@@ -577,6 +941,166 @@ bool cmny_db_trend(CmnyDb *db, const char *end_month, CmnyMonthTrend *out,
         out[i].expense_cents = summary.expense_cents;
     }
     return true;
+}
+
+bool cmny_db_budget_set(CmnyDb *db, const char *month, const char *category,
+                        int64_t limit_cents, char *err, size_t err_size) {
+    if (db == NULL || db->handle == NULL || !cmny_month_valid(month) ||
+        !cmny_text_valid(category, CMNY_CATEGORY_MAX, false) || limit_cents < 0 ||
+        limit_cents > 9000000000000000LL) {
+        set_error(err, err_size, "invalid budget");
+        return false;
+    }
+    const char *sql = limit_cents == 0
+        ? "DELETE FROM budgets WHERE month=? AND category=?"
+        : "INSERT INTO budgets(month,category,limit_cents) VALUES(?,?,?) "
+          "ON CONFLICT(month,category) DO UPDATE SET limit_cents=excluded.limit_cents";
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, month, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 2, category, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK && limit_cents > 0) rc = sqlite3_bind_int64(stmt, 3, limit_cents);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    bool ok = rc == SQLITE_DONE;
+    if (!ok) set_db_error(db, err, err_size, "cannot save budget");
+    (void)sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool cmny_db_budget_list(CmnyDb *db, const char *month, CmnyBudget *out, size_t cap,
+                         size_t *count, char *err, size_t err_size) {
+    if (db == NULL || db->handle == NULL || !cmny_month_valid(month) || out == NULL ||
+        count == NULL) {
+        set_error(err, err_size, "invalid budget query");
+        return false;
+    }
+    char next_month[8], start[11], end[11];
+    if (!cmny_month_shift(month, 1, next_month)) {
+        set_error(err, err_size, "invalid budget month");
+        return false;
+    }
+    (void)snprintf(start, sizeof(start), "%s-01", month);
+    (void)snprintf(end, sizeof(end), "%s-01", next_month);
+    static const char *sql =
+        "SELECT b.category,b.limit_cents,COALESCE(SUM(t.amount_cents),0) "
+        "FROM budgets AS b LEFT JOIN transactions AS t ON t.kind=1 "
+        "AND t.category=b.category AND t.occurred_on>=? AND t.occurred_on<? "
+        "WHERE b.month=? GROUP BY b.category,b.limit_cents ORDER BY b.category LIMIT ?";
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 1, start, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 2, end, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 3, month, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 4, (sqlite3_int64)cap);
+    if (rc != SQLITE_OK) {
+        set_db_error(db, err, err_size, "cannot prepare budget query");
+        (void)sqlite3_finalize(stmt);
+        return false;
+    }
+    size_t used = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW && used < cap) {
+        bool text_ok = copy_column(out[used].category, sizeof(out[used].category), stmt, 0);
+        out[used].limit_cents = sqlite3_column_int64(stmt, 1);
+        out[used].spent_cents = sqlite3_column_int64(stmt, 2);
+        if (!text_ok || !cmny_text_valid(out[used].category, CMNY_CATEGORY_MAX, false) ||
+            out[used].limit_cents <= 0 || out[used].spent_cents < 0) {
+            set_error(err, err_size, "database contains invalid budget data");
+            (void)sqlite3_finalize(stmt);
+            *count = used;
+            return false;
+        }
+        used++;
+    }
+    bool ok = rc == SQLITE_DONE;
+    if (!ok) set_db_error(db, err, err_size, "cannot read budgets");
+    *count = used;
+    (void)sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool cmny_db_recurring_add(CmnyDb *db, const CmnyTransaction *tx,
+                           char *err, size_t err_size) {
+    if (db == NULL || db->handle == NULL || !cmny_transaction_valid(tx, false)) {
+        set_error(err, err_size, "invalid recurring template");
+        return false;
+    }
+    int day = (tx->occurred_on[8] - '0') * 10 + (tx->occurred_on[9] - '0');
+    static const char *sql =
+        "INSERT OR IGNORE INTO recurring(kind,amount_cents,category,note,day_of_month) "
+        "VALUES(?,?,?,?,?)";
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, sql, -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 1, (int)tx->kind);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 2, tx->amount_cents);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 3, tx->category, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_text(stmt, 4, tx->note, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int(stmt, 5, day);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    bool ok = rc == SQLITE_DONE;
+    if (!ok) set_db_error(db, err, err_size, "cannot save recurring template");
+    (void)sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool cmny_db_recurring_list(CmnyDb *db, CmnyRecurring *out, size_t cap,
+                            size_t *count, char *err, size_t err_size) {
+    if (db == NULL || db->handle == NULL || out == NULL || count == NULL) {
+        set_error(err, err_size, "invalid recurring query");
+        return false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle,
+        "SELECT id,kind,amount_cents,category,note,day_of_month FROM recurring "
+        "ORDER BY kind,category,id LIMIT ?", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 1, (sqlite3_int64)cap);
+    if (rc != SQLITE_OK) {
+        set_db_error(db, err, err_size, "cannot prepare recurring query");
+        (void)sqlite3_finalize(stmt);
+        return false;
+    }
+    size_t used = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW && used < cap) {
+        out[used].id = sqlite3_column_int64(stmt, 0);
+        out[used].kind = (CmnyKind)sqlite3_column_int(stmt, 1);
+        out[used].amount_cents = sqlite3_column_int64(stmt, 2);
+        bool text_ok = copy_column(out[used].category, sizeof(out[used].category), stmt, 3) &&
+                       copy_column(out[used].note, sizeof(out[used].note), stmt, 4);
+        out[used].day_of_month = sqlite3_column_int(stmt, 5);
+        CmnyTransaction tx = {0};
+        tx.kind = out[used].kind;
+        tx.amount_cents = out[used].amount_cents;
+        (void)snprintf(tx.category, sizeof(tx.category), "%s", out[used].category);
+        (void)snprintf(tx.note, sizeof(tx.note), "%s", out[used].note);
+        (void)snprintf(tx.occurred_on, sizeof(tx.occurred_on), "2000-01-%02d",
+                       out[used].day_of_month);
+        if (!text_ok || out[used].id <= 0 || !cmny_transaction_valid(&tx, false)) {
+            set_error(err, err_size, "database contains invalid recurring data");
+            (void)sqlite3_finalize(stmt);
+            *count = used;
+            return false;
+        }
+        used++;
+    }
+    bool ok = rc == SQLITE_DONE;
+    if (!ok) set_db_error(db, err, err_size, "cannot read recurring templates");
+    *count = used;
+    (void)sqlite3_finalize(stmt);
+    return ok;
+}
+
+bool cmny_db_recurring_delete(CmnyDb *db, int64_t id, char *err, size_t err_size) {
+    if (db == NULL || db->handle == NULL || id <= 0) {
+        set_error(err, err_size, "invalid recurring template id");
+        return false;
+    }
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db->handle, "DELETE FROM recurring WHERE id=?", -1, &stmt, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_bind_int64(stmt, 1, id);
+    if (rc == SQLITE_OK) rc = sqlite3_step(stmt);
+    bool ok = rc == SQLITE_DONE && sqlite3_changes(db->handle) == 1;
+    if (!ok) set_db_error(db, err, err_size, "cannot delete recurring template");
+    (void)sqlite3_finalize(stmt);
+    return ok;
 }
 
 bool cmny_db_seed_demo(CmnyDb *db, char *err, size_t err_size) {
@@ -634,5 +1158,23 @@ bool cmny_db_seed_demo(CmnyDb *db, char *err, size_t err_size) {
         (void)sqlite3_exec(db->handle, "ROLLBACK", NULL, NULL, NULL);
         return false;
     }
+    if (!cmny_db_budget_set(db, "2026-07", "Housing", 120000, err, err_size) ||
+        !cmny_db_budget_set(db, "2026-07", "Food", 35000, err, err_size) ||
+        !cmny_db_budget_set(db, "2026-07", "Fun", 10000, err, err_size)) {
+        return false;
+    }
+    CmnyTransaction recurring = {0};
+    recurring.kind = CMNY_INCOME;
+    recurring.amount_cents = 320000;
+    (void)snprintf(recurring.category, sizeof(recurring.category), "Salary");
+    (void)snprintf(recurring.note, sizeof(recurring.note), "Monthly salary");
+    (void)snprintf(recurring.occurred_on, sizeof(recurring.occurred_on), "2026-07-01");
+    if (!cmny_db_recurring_add(db, &recurring, err, err_size)) return false;
+    recurring.kind = CMNY_EXPENSE;
+    recurring.amount_cents = 110000;
+    (void)snprintf(recurring.category, sizeof(recurring.category), "Housing");
+    (void)snprintf(recurring.note, sizeof(recurring.note), "Rent");
+    (void)snprintf(recurring.occurred_on, sizeof(recurring.occurred_on), "2026-07-02");
+    if (!cmny_db_recurring_add(db, &recurring, err, err_size)) return false;
     return true;
 }

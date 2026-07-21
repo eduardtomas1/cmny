@@ -14,7 +14,7 @@ import zipfile
 from pathlib import Path
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 ZIG_VERSION = "0.15.2"
 SQLITE_NUMBER = "3530300"
 SQLITE_VERSION = "3.53.3"
@@ -26,7 +26,10 @@ CACHE = ROOT / "build" / "release-cache"
 STAGE = ROOT / "build" / "release-stage"
 DIST = ROOT / "dist"
 
-APP_SOURCES = [ROOT / "src" / name for name in ("main.c", "core.c", "paths.c", "db.c", "ui.c")]
+APP_SOURCES = [
+    ROOT / "src" / name
+    for name in ("main.c", "core.c", "paths.c", "db.c", "csv.c", "ui.c")
+]
 PDC_COMMON = """
 addch addchstr addstr attr beep bkgd border clear color debug delch deleteln
 getch getstr getyx inch inchstr initscr inopts insch insstr instr kernel
@@ -219,6 +222,7 @@ def stage_package(platform_name: str, binary: Path) -> Path:
     os.chmod(directory / binary_name, 0o755)
     for name in ("README.md", "LICENSE"):
         shutil.copy2(ROOT / name, directory / name)
+    shutil.copytree(ROOT / "assets", directory / "assets", dirs_exist_ok=True)
     (directory / "THIRD_PARTY_NOTICES.txt").write_text(
         "CMNY THIRD-PARTY NOTICES\n\n"
         f"SQLite {SQLITE_VERSION} (https://www.sqlite.org/) - public domain; embedded in all packages.\n"

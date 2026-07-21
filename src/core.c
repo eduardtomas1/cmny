@@ -88,6 +88,14 @@ void cmny_money_format(int64_t cents, char *out, size_t out_size) {
     (void)snprintf(out, out_size, "%s%s.%02u", negative ? "-" : "", grouped, fraction);
 }
 
+void cmny_money_format_plain(int64_t cents, char *out, size_t out_size) {
+    if (out == NULL || out_size == 0) return;
+    bool negative = cents < 0;
+    uint64_t magnitude = negative ? (uint64_t)(-(cents + 1)) + 1U : (uint64_t)cents;
+    (void)snprintf(out, out_size, "%s%" PRIu64 ".%02u", negative ? "-" : "",
+                   magnitude / 100U, (unsigned)(magnitude % 100U));
+}
+
 bool cmny_currency_supported(const char *input, char output[4]) {
     if (input == NULL || output == NULL || strlen(input) != 3) return false;
     for (size_t i = 0; i < 3; i++) {
@@ -199,6 +207,15 @@ bool cmny_month_shift(const char *month, int delta, char out[8]) {
     return true;
 }
 
+bool cmny_date_for_month_day(const char *month, int day, char out[11]) {
+    if (!cmny_month_valid(month) || out == NULL || day < 1 || day > 31) return false;
+    for (int candidate = day; candidate >= 1; candidate--) {
+        (void)snprintf(out, 11, "%s-%02d", month, candidate);
+        if (cmny_date_valid(out)) return true;
+    }
+    return false;
+}
+
 void cmny_month_label(const char *month, char *out, size_t out_size) {
     static const char *names[] = {"", "January", "February", "March", "April", "May", "June",
                                   "July", "August", "September", "October", "November", "December"};
@@ -208,4 +225,26 @@ void cmny_month_label(const char *month, char *out, size_t out_size) {
     }
     int mon = (month[5] - '0') * 10 + (month[6] - '0');
     (void)snprintf(out, out_size, "%s %.4s", names[mon], month);
+}
+
+bool cmny_text_valid(const char *text, size_t maximum, bool allow_empty) {
+    if (text == NULL) return false;
+    size_t len = strlen(text);
+    if (len > maximum || (!allow_empty && len == 0)) return false;
+    bool has_non_space = allow_empty;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)text[i];
+        if (ch < 32 || ch > 126) return false;
+        if (!isspace(ch)) has_non_space = true;
+    }
+    return has_non_space;
+}
+
+bool cmny_transaction_valid(const CmnyTransaction *tx, bool require_id) {
+    return tx != NULL && (!require_id || tx->id > 0) &&
+           (tx->kind == CMNY_EXPENSE || tx->kind == CMNY_INCOME) &&
+           tx->amount_cents > 0 && tx->amount_cents <= 9000000000000000LL &&
+           cmny_text_valid(tx->category, CMNY_CATEGORY_MAX, false) &&
+           cmny_text_valid(tx->note, CMNY_NOTE_MAX, true) &&
+           cmny_date_valid(tx->occurred_on);
 }

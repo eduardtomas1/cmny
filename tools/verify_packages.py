@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PACKAGES = {
     f"cmny-v{VERSION}-macos-universal.tar.gz": "macos",
     f"cmny-v{VERSION}-linux-x86_64.tar.gz": "linux",
@@ -80,6 +80,8 @@ def main() -> None:
             root = roots[0]
             binary = root / ("cmny.exe" if kind == "windows" else "cmny")
             for required in (binary, root / "README.md", root / "LICENSE",
+                             root / "assets" / "screenshots" / "overview.svg",
+                             root / "assets" / "screenshots" / "reports.svg",
                              root / "THIRD_PARTY_NOTICES.txt", root / "INSTALL.txt"):
                 if not required.is_file():
                     raise AssertionError(f"missing {required.name} in {name}")

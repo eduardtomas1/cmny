@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    name: Source tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libncurses-dev libsqlite3-dev
+      - name: Build and test
+        run: make check
+      - name: Debug build
+        run: make debug
+      - name: Sanitizers
+        if: runner.os == 'Linux'
+        run: make sanitize
+
+  unix-packages:
+    name: Package smoke test (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: Linux
+            archive: dist/cmny-v0.2.0-linux-x86_64.tar.gz
+          - os: macos-latest
+            platform: macOS
+            archive: dist/cmny-v0.2.0-macos-universal.tar.gz
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run packaged app
+        shell: bash
+        run: |
+          mkdir package
+          tar -xzf "${{ matrix.archive }}" -C package
+          binary="$(find package -type f -name cmny -perm -u+x -print -quit)"
+          test -n "$binary"
+          "$binary" --version
+          "$binary" --db "$RUNNER_TEMP/cmny.db" --check
+      - name: Verify macOS code signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: codesign --verify --strict "$(find package -type f -name cmny -perm -u+x -print -quit)"
+
+  windows-package:
+    name: Package smoke test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run packaged app
+        shell: pwsh
+        run: |
+          Expand-Archive dist/cmny-v0.2.0-windows-x86_64.zip package
+          $binary = (Get-ChildItem package -Recurse -Filter cmny.exe | Select-Object -First 1).FullName
+          if (-not $binary) { throw "cmny.exe is missing" }
+          & $binary --version
+          if ($LASTEXITCODE -ne 0) { throw "version command failed" }
+          & $binary --db "$env:RUNNER_TEMP\cmny.db" --check
+          if ($LASTEXITCODE -ne 0) { throw "ledger check failed" }

@@ -36,7 +36,7 @@ def start(
     rows: int = 24,
     columns: int = 90,
     *,
-    theme: str = "ocean",
+    theme: str | None = "ocean",
     no_color: bool = True,
 ) -> tuple[subprocess.Popen[bytes], int]:
     master, slave = pty.openpty()
@@ -44,7 +44,9 @@ def start(
     environment = os.environ.copy()
     environment.pop("NO_COLOR", None)
     environment.update({"TERM": "xterm-256color", "LC_ALL": "C.UTF-8"})
-    command = [str(binary), "--db", str(database), "--ascii", "--theme", theme]
+    command = [str(binary), "--db", str(database), "--ascii"]
+    if theme is not None:
+        command.extend(["--theme", theme])
     if no_color:
         command.append("--no-color")
     process = subprocess.Popen(
@@ -87,19 +89,38 @@ def main() -> None:
         for keys in (
             b"n", b"1", b"1.234\r", b"\x1542.75\r", b"\r",
             b"\x15   \r", b"\x15Testing\r",
-            b"PTY integration entry\r", b"q",
+            b"PTY integration entry\r",
+            b"2", b"B", b"\r", b"100.00\r",
+            b"R", b"d", b"y", b"u", b"r", b"1", b"D", b"1", b"y", b"b", b"q",
         ):
             send(master, keys)
         finish(process, master)
 
         with sqlite3.connect(database) as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 "SELECT kind, amount_cents, category, note FROM transactions"
+                " ORDER BY id"
+            ).fetchall()
+            budget = connection.execute(
+                "SELECT category, limit_cents FROM budgets"
             ).fetchone()
-        assert row == (1, 4275, "Testing", "PTY integration entry"), row
+            recurring_count = connection.execute("SELECT count(*) FROM recurring").fetchone()[0]
+            preferences = dict(connection.execute(
+                "SELECT key, value FROM settings WHERE key IN "
+                "('last_expense_category', 'screen')"
+            ))
+        expected = (1, 4275, "Testing", "PTY integration entry")
+        assert rows == [expected, expected], rows
+        assert budget == ("Testing", 10000), budget
+        assert recurring_count == 0
+        assert preferences == {"last_expense_category": "Testing", "screen": "activity"}
+        backups = list(Path(directory).glob("cmny.db.backup-*"))
+        assert len(backups) == 1, backups
+        with sqlite3.connect(backups[0]) as connection:
+            assert connection.execute("PRAGMA quick_check").fetchone()[0] == "ok"
 
         process, master = start(binary, database)
-        for keys in (b"2", b"d", b"y", b"q"):
+        for keys in (b"d", b"y", b"u", b"d", b"y", b"d", b"y", b"q"):
             send(master, keys)
         finish(process, master)
         with sqlite3.connect(database) as connection:
@@ -125,8 +146,16 @@ def main() -> None:
         finish(process, master)
 
         process, master = start(binary, database, theme="violet", no_color=False)
-        for keys in (b"p", b"p", b"q"):
+        for keys in (b"p", b"q"):
             send(master, keys)
+        finish(process, master)
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT value FROM settings WHERE key='theme'"
+            ).fetchone()[0] == "amber"
+
+        process, master = start(binary, database, theme=None, no_color=False)
+        send(master, b"q")
         finish(process, master)
 
     print("ok - TUI PTY tests")

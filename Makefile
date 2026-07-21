@@ -29,7 +29,7 @@ CFLAGS ?= -O2
 CFLAGS += -std=c17 -Wall -Wextra -Wpedantic -Wshadow -Wconversion \
           -Wstrict-prototypes -Wmissing-prototypes -Wformat=2
 
-SOURCES := src/main.c src/core.c src/paths.c src/db.c src/ui.c
+SOURCES := src/main.c src/core.c src/paths.c src/db.c src/csv.c src/ui.c
 OBJECTS := $(SOURCES:src/%.c=$(BUILD_DIR)/%.o)
 DEPENDENCIES := $(OBJECTS:.o=.d)
 BINARY := $(BUILD_DIR)/cmny
@@ -60,7 +60,7 @@ demo: $(BINARY)
 
 screenshots: $(BINARY)
 	python3 tools/capture_demo.py --screen overview --output assets/screenshots/overview.svg
-	python3 tools/capture_demo.py --screen activity --theme violet --output assets/screenshots/activity.svg
+	python3 tools/capture_demo.py --screen reports --theme violet --output assets/screenshots/reports.svg
 
 $(BUILD_DIR)/test_core: tests/test_core.c src/core.c include/cmny.h tests/test.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/test_core.c src/core.c $(LDFLAGS) -o $@
@@ -69,10 +69,17 @@ $(BUILD_DIR)/test_db: tests/test_db.c src/core.c src/db.c include/cmny.h tests/t
 	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/test_db.c src/core.c src/db.c \
 		$(LDFLAGS) $(SQLITE_LIBS) -o $@
 
-test: $(BINARY) $(BUILD_DIR)/test_core $(BUILD_DIR)/test_db
+$(BUILD_DIR)/test_csv: tests/test_csv.c src/core.c src/db.c src/csv.c include/cmny.h tests/test.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) tests/test_csv.c src/core.c src/db.c src/csv.c \
+		$(LDFLAGS) $(SQLITE_LIBS) -o $@
+
+test: $(BINARY) $(BUILD_DIR)/test_core $(BUILD_DIR)/test_db $(BUILD_DIR)/test_csv
 	$(BUILD_DIR)/test_core
 	$(BUILD_DIR)/test_db
+	$(BUILD_DIR)/test_csv
+	python3 tests/test_cli.py $(BINARY)
 	python3 tests/test_tui.py $(BINARY)
+	python3 tests/test_capture.py
 
 check: all test
 

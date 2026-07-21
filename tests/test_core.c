@@ -35,6 +35,8 @@ static void test_money_format(void) {
     ASSERT_TRUE(strcmp(value, "-4.30") == 0);
     cmny_money_format(INT64_MIN, value, sizeof(value));
     ASSERT_TRUE(strcmp(value, "-92,233,720,368,547,758.08") == 0);
+    cmny_money_format_plain(123456, value, sizeof(value));
+    ASSERT_TRUE(strcmp(value, "1234.56") == 0);
 }
 
 static void test_dates(void) {
@@ -53,6 +55,27 @@ static void test_dates(void) {
     ASSERT_TRUE(strcmp(month, "2027-01") == 0);
     ASSERT_TRUE(!cmny_month_shift("2026-07", INT_MAX, month));
     ASSERT_TRUE(!cmny_month_shift("2026-07", INT_MIN, month));
+
+    char date[11];
+    ASSERT_TRUE(cmny_date_for_month_day("2026-02", 31, date));
+    ASSERT_TRUE(strcmp(date, "2026-02-28") == 0);
+    ASSERT_TRUE(cmny_date_for_month_day("2024-02", 29, date));
+    ASSERT_TRUE(strcmp(date, "2024-02-29") == 0);
+}
+
+static void test_transaction_validation(void) {
+    CmnyTransaction tx = {0};
+    tx.kind = CMNY_EXPENSE;
+    tx.amount_cents = 1250;
+    (void)snprintf(tx.category, sizeof(tx.category), "Food");
+    (void)snprintf(tx.note, sizeof(tx.note), "Lunch");
+    (void)snprintf(tx.occurred_on, sizeof(tx.occurred_on), "2026-07-21");
+    ASSERT_TRUE(cmny_transaction_valid(&tx, false));
+    ASSERT_TRUE(!cmny_transaction_valid(&tx, true));
+    tx.id = 1;
+    ASSERT_TRUE(cmny_transaction_valid(&tx, true));
+    tx.note[0] = '\n';
+    ASSERT_TRUE(!cmny_transaction_valid(&tx, true));
 }
 
 static void test_currency(void) {
@@ -78,6 +101,7 @@ int main(void) {
     test_dates();
     test_currency();
     test_themes();
+    test_transaction_validation();
     (void)printf("ok - core tests\n");
     return 0;
 }

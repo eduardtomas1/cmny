@@ -59,6 +59,7 @@ class Terminal:
         self.saved = (0, 0)
         self.style = Style()
         self.last_char = " "
+        self.pending = ""
 
     def clear(self) -> None:
         self.cells = [[Cell(style=Style()) for _ in range(self.columns)] for _ in range(self.rows)]
@@ -157,11 +158,15 @@ class Terminal:
                 self.style.bg = None
 
     def feed(self, data: bytes) -> None:
-        text = data.decode("utf-8", errors="ignore")
+        text = self.pending + data.decode("utf-8", errors="ignore")
+        self.pending = ""
         index = 0
         while index < len(text):
             char = text[index]
             if char == "\x1b":
+                if index + 1 >= len(text):
+                    self.pending = text[index:]
+                    break
                 if index + 1 < len(text) and text[index + 1] == "[":
                     end = index + 2
                     while end < len(text) and not ("@" <= text[end] <= "~"):
@@ -170,6 +175,8 @@ class Terminal:
                         self.csi(text[index + 2 : end], text[end])
                         index = end + 1
                         continue
+                    self.pending = text[index:]
+                    break
                 if index + 1 < len(text) and text[index + 1] in "78":
                     if text[index + 1] == "7":
                         self.saved = (self.row, self.column)
@@ -180,6 +187,9 @@ class Terminal:
                 if index + 2 < len(text) and text[index + 1] in "()" :
                     index += 3
                     continue
+                if text[index + 1] in "()":
+                    self.pending = text[index:]
+                    break
                 index += 2
                 continue
             if char == "\r":
@@ -243,28 +253,19 @@ def render_svg(terminal: Terminal, output: Path, label: str) -> None:
                     f'<rect x="{padding + col * cell_width:.2f}" y="{origin_y + row_index * line_height - 13.8:.2f}" '
                     f'width="{cell_width + 0.2:.2f}" height="{line_height:.2f}" fill="{background}"/>'
                 )
-        col = 0
-        while col < terminal.columns:
-            if row[col].char == " ":
-                col += 1
+        for col, cell in enumerate(row):
+            if cell.char == " ":
                 continue
-            start = col
-            style = row[col].style or Style()
-            run = []
-            while col < terminal.columns and (row[col].style or Style()) == style:
-                run.append(row[col].char)
-                col += 1
-            text = "".join(run).rstrip()
-            if not text:
-                continue
+            style = cell.style or Style()
             foreground, _ = colors(style)
             weight = "700" if style.bold else "400"
             opacity = "0.55" if style.dim else "1"
             parts.append(
-                f'<text x="{padding + start * cell_width:.2f}" y="{origin_y + row_index * line_height:.2f}" '
+                f'<text x="{padding + col * cell_width:.2f}" y="{origin_y + row_index * line_height:.2f}" '
                 f'font-family="Menlo, monospace" font-size="14" '
-                f'font-variant-ligatures="none" xml:space="preserve" font-weight="{weight}" opacity="{opacity}" '
-                f'fill="{foreground}">{html.escape(text)}</text>'
+                f'font-variant-ligatures="none" '
+                f'font-weight="{weight}" opacity="{opacity}" '
+                f'fill="{foreground}">{html.escape(cell.char)}</text>'
             )
     parts.append("</svg>\n")
     output.parent.mkdir(parents=True, exist_ok=True)

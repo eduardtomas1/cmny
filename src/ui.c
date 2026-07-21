@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum {
     COLOR_BRAND = 1,
@@ -57,12 +58,16 @@ typedef struct {
     CmnyCategoryTotal categories[CMNY_CATEGORY_LIMIT];
     size_t category_count;
     CmnyMonthTrend trend[CMNY_TREND_MONTHS];
+    CmnyBudget budgets[CMNY_BUDGET_LIMIT];
+    size_t budget_count;
     CmnyTransaction transactions[CMNY_TX_LIMIT];
     size_t transaction_count;
     size_t activity_offset;
     size_t activity_total;
     CmnyTransaction recent[6];
     size_t recent_count;
+    CmnyTransaction last_deleted;
+    bool can_undo;
     char status[256];
     bool running;
 } UiState;
@@ -164,6 +169,8 @@ static void refresh_state(UiState *state) {
         !cmny_db_month_summary(state->db, previous_month, &state->previous, err, sizeof(err)) ||
         !cmny_db_category_totals(state->db, state->month, state->categories,
                                  CMNY_CATEGORY_LIMIT, &state->category_count, err, sizeof(err)) ||
+        !cmny_db_budget_list(state->db, state->month, state->budgets,
+                             CMNY_BUDGET_LIMIT, &state->budget_count, err, sizeof(err)) ||
         !cmny_db_trend(state->db, state->month, state->trend, CMNY_TREND_MONTHS,
                        err, sizeof(err)) ||
         !cmny_db_count(state->db, state->month, state->search, state->kind_filter,
@@ -230,7 +237,7 @@ static void draw_footer(const UiState *state, int rows, int columns) {
         put_clipped(rows - 1, 1, columns - 2, state->status);
     } else {
         put_clipped(rows - 1, 1, columns - 2,
-                    "n add  [ ] month  t today  p theme  ? help  q quit");
+                    "n add  B budget  r recurring  b backup  p theme  ? help  q quit");
     }
     (void)attroff(A_REVERSE | attr_color(COLOR_MUTED));
 }
@@ -332,6 +339,43 @@ static void draw_trend(const UiState *state, int y, int x, int height, int width
         cmny_money_format(state->trend[i].expense_cents, amount, sizeof(amount));
         int amount_x = x + width - (int)strlen(amount) - 2;
         if (amount_x > x + 10 + filled) put_clipped(row, amount_x, 14, amount);
+    }
+}
+
+static void draw_budgets(const UiState *state, int y, int x, int height, int width) {
+    draw_box(y, x, height, width, "BUDGETS  [B] SET");
+    if (state->budget_count == 0) {
+        (void)attron(A_DIM | attr_color(COLOR_MUTED));
+        put_clipped(y + 2, x + 2, width - 4, "No budgets yet. Press B to set one.");
+        (void)attroff(A_DIM | attr_color(COLOR_MUTED));
+        return;
+    }
+    int bar_start = x + min_int(16, max_int(10, width / 3));
+    int bar_width = max_int(1, width - (bar_start - x) - 19);
+    size_t shown = state->budget_count < (size_t)(height - 2)
+        ? state->budget_count : (size_t)(height - 2);
+    for (size_t i = 0; i < shown; i++) {
+        int row = y + 1 + (int)i;
+        put_clipped(row, x + 2, bar_start - x - 3, state->budgets[i].category);
+        double ratio = (double)state->budgets[i].spent_cents /
+                       (double)state->budgets[i].limit_cents;
+        int filled = (int)(ratio * (double)bar_width);
+        if (state->budgets[i].spent_cents > 0 && filled < 1) filled = 1;
+        if (filled > bar_width) filled = bar_width;
+        int color = ratio > 1.0 ? COLOR_WARNING : COLOR_INCOME;
+        (void)attron(attr_color(color));
+        if (filled > 0) (void)mvhline(row, bar_start, '#', filled);
+        (void)attroff(attr_color(color));
+        if (filled < bar_width) {
+            (void)attron(A_DIM);
+            (void)mvhline(row, bar_start + filled, '.', bar_width - filled);
+            (void)attroff(A_DIM);
+        }
+        char spent[32], limit[32], value[70];
+        cmny_money_format_plain(state->budgets[i].spent_cents, spent, sizeof(spent));
+        cmny_money_format_plain(state->budgets[i].limit_cents, limit, sizeof(limit));
+        (void)snprintf(value, sizeof(value), "%s/%s", spent, limit);
+        put_clipped(row, x + width - 17, 15, value);
     }
 }
 
@@ -454,7 +498,7 @@ static void draw_activity(const UiState *state, int rows, int columns) {
     size_t range_start = state->activity_total == 0 ? 0 : state->activity_offset + 1;
     size_t range_end = state->activity_offset + state->transaction_count;
     if (state->search[0] != '\0') {
-        (void)snprintf(title, sizeof(title), "ACTIVITY  %zu-%zu/%zu  filter:%s  search:%s",
+        (void)snprintf(title, sizeof(title), "ACTIVITY  %zu-%zu/%zu  all months  filter:%s  search:%s",
                        range_start, range_end, state->activity_total, filter, state->search);
     } else {
         (void)snprintf(title, sizeof(title), "ACTIVITY  %zu-%zu/%zu  filter:%s",
@@ -486,12 +530,12 @@ static void draw_reports(const UiState *state, int rows, int columns) {
     (void)attroff(A_BOLD | attr_color(delta <= 0 ? COLOR_INCOME : COLOR_WARNING));
     if (columns >= 78) {
         int left = columns / 2;
-        draw_categories(state, 5, 0, rows - 6, left);
+        draw_budgets(state, 5, 0, rows - 6, left);
         draw_trend(state, 5, left + 1, rows - 6, columns - left - 1);
     } else {
         int available = rows - 6;
         int first = max_int(5, available / 2);
-        draw_categories(state, 5, 0, first, columns);
+        draw_budgets(state, 5, 0, first, columns);
         if (available - first >= 5) draw_trend(state, 5 + first, 0, available - first, columns);
     }
 }
@@ -691,29 +735,22 @@ static void message_modal(const char *title, const char *const *lines, size_t co
 
 static void show_help(void) {
     static const char *lines[] = {
-        "  _____ __  __ _   ___   __",
-        " / ____|  \\/  | \\ | |\\ \\ / /",
-        "| |    | |\\/| |  \\| |\\ V /",
-        "| |____| |  | | |\\  | | |",
-        " \\_____|_|  |_|_| \\_| |_|",
-        "",
         "1 / 2 / 3      Overview / Activity / Reports",
         "n              Add a transaction",
         "[ / ]          Previous / next month",
         "t              Jump to the current month",
         "Up/Down, j/k   Move through activity",
         "e / d          Edit / delete selected activity",
-        "/              Search category and note",
+        "u              Undo the last deletion",
+        "/              Search every month",
         "f / c          Cycle filter / clear filters",
+        "B              Set or remove a monthly budget",
+        "R / r / D      Save / apply / delete recurring",
+        "b              Create a timestamped backup",
         "p              Cycle color theme",
         "? / q          Help / quit"
     };
     message_modal("CMNY HELP", lines, sizeof(lines) / sizeof(lines[0]));
-}
-
-static void plain_amount(int64_t cents, char *out, size_t out_size) {
-    (void)snprintf(out, out_size, "%lld.%02lld",
-                   (long long)(cents / 100), (long long)(cents % 100));
 }
 
 static void edit_transaction(UiState *state, const CmnyTransaction *existing) {
@@ -730,7 +767,7 @@ edit_fields:
     if (!choose_kind(&draft.kind)) return;
 
     char amount[64] = {0};
-    if (draft.amount_cents > 0) plain_amount(draft.amount_cents, amount, sizeof(amount));
+    if (draft.amount_cents > 0) cmny_money_format_plain(draft.amount_cents, amount, sizeof(amount));
     bool amount_invalid = false;
     for (;;) {
         if (!input_modal(editing ? "EDIT TRANSACTION" : "NEW TRANSACTION",
@@ -751,8 +788,11 @@ edit_fields:
         date_invalid = true;
     }
     if (draft.category[0] == '\0') {
-        (void)snprintf(draft.category, sizeof(draft.category), "%s",
-                       draft.kind == CMNY_INCOME ? "Salary" : "Food");
+        const char *key = draft.kind == CMNY_INCOME ? "last_income_category" : "last_expense_category";
+        if (!cmny_db_setting_get(state->db, key, draft.category, sizeof(draft.category))) {
+            (void)snprintf(draft.category, sizeof(draft.category), "%s",
+                           draft.kind == CMNY_INCOME ? "Salary" : "Food");
+        }
     }
     bool category_invalid = false;
     for (;;) {
@@ -788,6 +828,9 @@ retry_save:
     memcpy(state->month, draft.occurred_on, 7);
     state->month[7] = '\0';
     state->activity_offset = 0;
+    const char *category_key = draft.kind == CMNY_INCOME
+        ? "last_income_category" : "last_expense_category";
+    (void)cmny_db_setting_set(state->db, category_key, draft.category, err, sizeof(err));
     statusf(state, editing ? "Transaction updated." : "Transaction saved.");
     refresh_state(state);
     statusf(state, editing ? "Transaction updated." : "Transaction saved.");
@@ -805,6 +848,180 @@ static void show_detail(const UiState *state, const CmnyTransaction *tx) {
     (void)snprintf(note, sizeof(note), "Note      %s", tx->note[0] != '\0' ? tx->note : "-");
     const char *lines[] = {id, kind, amount, date, category, note};
     message_modal("TRANSACTION DETAIL", lines, sizeof(lines) / sizeof(lines[0]));
+}
+
+static bool zero_amount(const char *text) {
+    while (isspace((unsigned char)*text)) text++;
+    return strcmp(text, "0") == 0 || strcmp(text, "0.0") == 0 ||
+           strcmp(text, "0.00") == 0 || strcmp(text, "0,0") == 0 ||
+           strcmp(text, "0,00") == 0;
+}
+
+static void set_budget(UiState *state) {
+    char category[CMNY_CATEGORY_MAX + 1] = {0};
+    if (state->screen == SCREEN_ACTIVITY && state->transaction_count > 0) {
+        (void)snprintf(category, sizeof(category), "%s",
+                       state->transactions[state->selected].category);
+    } else if (state->budget_count > 0) {
+        (void)snprintf(category, sizeof(category), "%s", state->budgets[0].category);
+    } else {
+        (void)cmny_db_setting_get(state->db, "last_expense_category", category, sizeof(category));
+    }
+    if (!input_modal("MONTHLY BUDGET", "Category", category, sizeof(category)) ||
+        !cmny_text_valid(category, CMNY_CATEGORY_MAX, false)) return;
+
+    char amount[64] = {0};
+    for (size_t i = 0; i < state->budget_count; i++) {
+        if (strcmp(category, state->budgets[i].category) == 0) {
+            cmny_money_format_plain(state->budgets[i].limit_cents, amount, sizeof(amount));
+            break;
+        }
+    }
+    int64_t limit = 0;
+    for (;;) {
+        if (!input_modal("MONTHLY BUDGET", "Monthly limit; enter 0 to remove", amount,
+                         sizeof(amount))) return;
+        if (zero_amount(amount)) break;
+        if (cmny_money_parse(amount, &limit) && limit <= 9000000000000000LL) break;
+    }
+    char err[256] = {0};
+    if (!cmny_db_budget_set(state->db, state->month, category, limit, err, sizeof(err))) {
+        statusf(state, "Budget failed: %s", err);
+        return;
+    }
+    refresh_state(state);
+    statusf(state, limit == 0 ? "Budget removed for %s." : "Budget saved for %s.", category);
+}
+
+static bool choose_recurring(UiState *state, const char *title, CmnyRecurring *selected) {
+    CmnyRecurring items[CMNY_RECURRING_LIMIT];
+    size_t count = 0;
+    char err[256] = {0};
+    if (!cmny_db_recurring_list(state->db, items, CMNY_RECURRING_LIMIT, &count, err, sizeof(err))) {
+        statusf(state, "Recurring error: %s", err);
+        return false;
+    }
+    if (count == 0) {
+        const char *lines[] = {"No recurring templates yet.",
+                               "Select an activity and press R to save one."};
+        message_modal(title, lines, sizeof(lines) / sizeof(lines[0]));
+        return false;
+    }
+    (void)timeout(-1);
+    for (;;) {
+        int rows, columns;
+        getmaxyx(stdscr, rows, columns);
+        int width = min_int(78, columns - 4);
+        int height = (int)count + 4;
+        int y = max_int(0, (rows - height) / 2);
+        int x = max_int(0, (columns - width) / 2);
+        (void)erase();
+        if (rows < height + 1 || width < 44) {
+            draw_resize(rows, columns);
+        } else {
+            draw_box(y, x, height, width, title);
+            for (size_t i = 0; i < count; i++) {
+                char amount[64], line[180];
+                cmny_money_format_plain(items[i].amount_cents, amount, sizeof(amount));
+                (void)snprintf(line, sizeof(line), "%zu  %-8s  %-20s  %s  day %d",
+                               i + 1, items[i].kind == CMNY_INCOME ? "Income" : "Expense",
+                               items[i].category, amount, items[i].day_of_month);
+                put_clipped(y + 1 + (int)i, x + 2, width - 4, line);
+            }
+            (void)attron(A_DIM);
+            put_clipped(y + height - 2, x + 2, width - 4, "Press a number; Esc cancels");
+            (void)attroff(A_DIM);
+        }
+        (void)refresh();
+        int ch = getch();
+        if (interrupted || ch == 27) { (void)timeout(250); return false; }
+        if (ch == KEY_RESIZE) continue;
+        if (ch >= '1' && ch <= '9' && (size_t)(ch - '1') < count) {
+            *selected = items[ch - '1'];
+            (void)timeout(250);
+            return true;
+        }
+    }
+}
+
+static void apply_recurring(UiState *state) {
+    CmnyRecurring item = {0};
+    if (!choose_recurring(state, "APPLY RECURRING", &item)) return;
+    CmnyTransaction tx = {0};
+    tx.kind = item.kind;
+    tx.amount_cents = item.amount_cents;
+    (void)snprintf(tx.category, sizeof(tx.category), "%s", item.category);
+    (void)snprintf(tx.note, sizeof(tx.note), "%s", item.note);
+    if (!cmny_date_for_month_day(state->month, item.day_of_month, tx.occurred_on)) return;
+    char err[256] = {0};
+    if (!cmny_db_add(state->db, &tx, NULL, err, sizeof(err))) {
+        statusf(state, "Recurring entry failed: %s", err);
+        return;
+    }
+    refresh_state(state);
+    statusf(state, "Recurring %s added for %s.", item.category, tx.occurred_on);
+}
+
+static void delete_recurring(UiState *state) {
+    CmnyRecurring item = {0};
+    if (!choose_recurring(state, "DELETE RECURRING", &item)) return;
+    char question[160];
+    (void)snprintf(question, sizeof(question), "Delete recurring template %s?", item.category);
+    if (!confirm_modal("DELETE RECURRING", question)) return;
+    char err[256] = {0};
+    if (cmny_db_recurring_delete(state->db, item.id, err, sizeof(err))) {
+        statusf(state, "Recurring template deleted.");
+    } else {
+        statusf(state, "Recurring delete failed: %s", err);
+    }
+}
+
+static void save_recurring(UiState *state) {
+    if (state->screen != SCREEN_ACTIVITY || state->transaction_count == 0) {
+        statusf(state, "Select an activity first, then press R.");
+        return;
+    }
+    char err[256] = {0};
+    if (cmny_db_recurring_add(state->db, &state->transactions[state->selected], err, sizeof(err))) {
+        statusf(state, "Recurring template saved.");
+    } else {
+        statusf(state, "Recurring save failed: %s", err);
+    }
+}
+
+static void create_backup(UiState *state) {
+    if (state->options->demo) {
+        statusf(state, "Demo data does not need a backup.");
+        return;
+    }
+    char path[4200];
+    int written = snprintf(path, sizeof(path), "%s.backup-%lld", state->db_path,
+                           (long long)time(NULL));
+    if (written < 0 || (size_t)written >= sizeof(path)) {
+        statusf(state, "Backup path is too long.");
+        return;
+    }
+    char err[256] = {0};
+    if (cmny_db_backup(state->db, path, err, sizeof(err))) {
+        statusf(state, "Backup created: %s", path);
+    } else {
+        statusf(state, "Backup failed: %s", err);
+    }
+}
+
+static void undo_delete(UiState *state) {
+    if (!state->can_undo) {
+        statusf(state, "Nothing to undo.");
+        return;
+    }
+    char err[256] = {0};
+    if (!cmny_db_add(state->db, &state->last_deleted, NULL, err, sizeof(err))) {
+        statusf(state, "Undo failed: %s", err);
+        return;
+    }
+    state->can_undo = false;
+    refresh_state(state);
+    statusf(state, "Deleted transaction restored.");
 }
 
 static void handle_activity(UiState *state, int ch) {
@@ -846,8 +1063,10 @@ static void handle_activity(UiState *state, int ch) {
         if (confirm_modal("DELETE TRANSACTION", question)) {
             char err[256] = {0};
             if (cmny_db_delete(state->db, selected.id, err, sizeof(err))) {
+                state->last_deleted = selected;
+                state->can_undo = true;
                 refresh_state(state);
-                statusf(state, "Transaction deleted.");
+                statusf(state, "Transaction deleted. Press u to undo.");
             } else {
                 statusf(state, "Delete failed: %s", err);
             }
@@ -855,7 +1074,8 @@ static void handle_activity(UiState *state, int ch) {
     } else if (ch == '/') {
         char search[sizeof(state->search)];
         (void)snprintf(search, sizeof(search), "%s", state->search);
-        if (input_modal("SEARCH", "Search category or note", search, sizeof(search))) {
+        if (input_modal("SEARCH", "Search category or note across every month", search,
+                        sizeof(search))) {
             (void)snprintf(state->search, sizeof(state->search), "%s", search);
             state->selected = 0;
             state->activity_offset = 0;
@@ -876,17 +1096,35 @@ static void handle_activity(UiState *state, int ch) {
     }
 }
 
+static void choose_screen(UiState *state, Screen screen, const char *name) {
+    state->screen = screen;
+    char err[256] = {0};
+    (void)cmny_db_setting_set(state->db, "screen", name, err, sizeof(err));
+}
+
 static void handle_key(UiState *state, int ch) {
     if (ch == 'q' || ch == 'Q') {
         state->running = false;
     } else if (ch == '1') {
-        state->screen = SCREEN_OVERVIEW;
+        choose_screen(state, SCREEN_OVERVIEW, "overview");
     } else if (ch == '2') {
-        state->screen = SCREEN_ACTIVITY;
+        choose_screen(state, SCREEN_ACTIVITY, "activity");
     } else if (ch == '3') {
-        state->screen = SCREEN_REPORTS;
+        choose_screen(state, SCREEN_REPORTS, "reports");
     } else if (ch == 'n' || ch == 'a') {
         edit_transaction(state, NULL);
+    } else if (ch == 'u') {
+        undo_delete(state);
+    } else if (ch == 'B') {
+        set_budget(state);
+    } else if (ch == 'R') {
+        save_recurring(state);
+    } else if (ch == 'r') {
+        apply_recurring(state);
+    } else if (ch == 'D') {
+        delete_recurring(state);
+    } else if (ch == 'b') {
+        create_backup(state);
     } else if (ch == '[') {
         char shifted[8];
         if (cmny_month_shift(state->month, -1, shifted)) {
@@ -915,6 +1153,9 @@ static void handle_key(UiState *state, int ch) {
             CmnyTheme next = (CmnyTheme)(((int)state->theme + 1) % (int)CMNY_THEME_COUNT);
             if (apply_theme(next, theme_background)) {
                 state->theme = next;
+                char err[256] = {0};
+                (void)cmny_db_setting_set(state->db, "theme", cmny_theme_name(state->theme),
+                                          err, sizeof(err));
                 statusf(state, "Theme: %s", cmny_theme_name(state->theme));
             } else {
                 statusf(state, "This terminal could not activate the next theme.");
@@ -923,7 +1164,7 @@ static void handle_key(UiState *state, int ch) {
     } else if (ch == '?') {
         show_help();
     } else if ((ch == '\n' || ch == '\r' || ch == KEY_ENTER) && state->screen == SCREEN_OVERVIEW) {
-        state->screen = SCREEN_ACTIVITY;
+        choose_screen(state, SCREEN_ACTIVITY, "activity");
     } else if (state->screen == SCREEN_ACTIVITY) {
         handle_activity(state, ch);
     }
@@ -936,6 +1177,15 @@ int cmny_ui_run(CmnyDb *db, const CmnyOptions *options, const char *db_path) {
     state.db_path = db_path;
     state.screen = SCREEN_OVERVIEW;
     state.theme = options->theme;
+    char preference[32] = {0};
+    if (!options->theme_explicit &&
+        cmny_db_setting_get(db, "theme", preference, sizeof(preference))) {
+        (void)cmny_theme_parse(preference, &state.theme);
+    }
+    if (cmny_db_setting_get(db, "screen", preference, sizeof(preference))) {
+        if (strcmp(preference, "activity") == 0) state.screen = SCREEN_ACTIVITY;
+        else if (strcmp(preference, "reports") == 0) state.screen = SCREEN_REPORTS;
+    }
     state.running = true;
     if (options->demo) {
         (void)snprintf(state.month, sizeof(state.month), "2026-07");

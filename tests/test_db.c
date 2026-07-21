@@ -72,6 +72,8 @@ int main(void) {
 
     ASSERT_TRUE(cmny_db_open(&db, path, false, "EUR", currency, err, sizeof(err)));
     ASSERT_TRUE(strcmp(currency, "EUR") == 0);
+    int schema_version = 0;
+    ASSERT_TRUE(sqlite3_exec(db.handle, "PRAGMA user_version", NULL, NULL, NULL) == SQLITE_OK);
 
     ASSERT_TRUE(sqlite3_exec(db.handle,
         "INSERT INTO transactions(kind,amount_cents,category,note,occurred_on) "
@@ -110,6 +112,10 @@ int main(void) {
                              rows, 8, &count, err, sizeof(err)));
     ASSERT_EQ_I64(1, count);
     ASSERT_EQ_I64(rent.id, rows[0].id);
+    ASSERT_TRUE(cmny_db_list(&db, "2026-07", "June", CMNY_EXPENSE, 0,
+                             rows, 8, &count, err, sizeof(err)));
+    ASSERT_EQ_I64(1, count);
+    ASSERT_EQ_I64(old.id, rows[0].id);
     ASSERT_TRUE(cmny_db_count(&db, "2026-07", "", 0, &count, err, sizeof(err)));
     ASSERT_EQ_I64(3, count);
     ASSERT_TRUE(cmny_db_list(&db, "2026-07", "", 0, 2, rows, 8, &count, err, sizeof(err)));
@@ -121,6 +127,26 @@ int main(void) {
     ASSERT_EQ_I64(2, count);
     ASSERT_TRUE(strcmp(categories[0].category, "Housing") == 0);
     ASSERT_EQ_I64(100000, categories[0].amount_cents);
+
+    char setting[32] = {0};
+    ASSERT_TRUE(cmny_db_setting_set(&db, "theme", "violet", err, sizeof(err)));
+    ASSERT_TRUE(cmny_db_setting_get(&db, "theme", setting, sizeof(setting)));
+    ASSERT_TRUE(strcmp(setting, "violet") == 0);
+
+    ASSERT_TRUE(cmny_db_budget_set(&db, "2026-07", "Food", 30000, err, sizeof(err)));
+    CmnyBudget budgets[4];
+    ASSERT_TRUE(cmny_db_budget_list(&db, "2026-07", budgets, 4, &count, err, sizeof(err)));
+    ASSERT_EQ_I64(1, count);
+    ASSERT_TRUE(strcmp(budgets[0].category, "Food") == 0);
+    ASSERT_EQ_I64(30000, budgets[0].limit_cents);
+    ASSERT_EQ_I64(2530, budgets[0].spent_cents);
+
+    ASSERT_TRUE(cmny_db_recurring_add(&db, &salary, err, sizeof(err)));
+    CmnyRecurring recurring[4];
+    ASSERT_TRUE(cmny_db_recurring_list(&db, recurring, 4, &count, err, sizeof(err)));
+    ASSERT_EQ_I64(1, count);
+    ASSERT_TRUE(strcmp(recurring[0].category, "Salary") == 0);
+    ASSERT_EQ_I64(1, recurring[0].day_of_month);
 
     food.amount_cents = 4000;
     (void)snprintf(food.note, sizeof(food.note), "Groceries and lunch");
@@ -140,6 +166,22 @@ int main(void) {
     CmnyTransaction invalid = transaction(CMNY_EXPENSE, 0, "Food", "bad", "2026-02-30");
     ASSERT_TRUE(!cmny_db_add(&db, &invalid, NULL, err, sizeof(err)));
 
+    char backup_path[] = "build/cmny-backup-XXXXXX";
+    int backup_descriptor = mkstemp(backup_path);
+    ASSERT_TRUE(backup_descriptor >= 0);
+    ASSERT_TRUE(close(backup_descriptor) == 0);
+    ASSERT_TRUE(unlink(backup_path) == 0);
+    ASSERT_TRUE(cmny_db_check(&db, err, sizeof(err)));
+    ASSERT_TRUE(cmny_db_backup(&db, backup_path, err, sizeof(err)));
+    CmnyTransaction extra = transaction(CMNY_EXPENSE, 999, "Fun", "Temporary", "2026-07-22");
+    ASSERT_TRUE(cmny_db_add(&db, &extra, NULL, err, sizeof(err)));
+    ASSERT_TRUE(cmny_db_month_summary(&db, "2026-07", &summary, err, sizeof(err)));
+    ASSERT_EQ_I64(3, summary.transaction_count);
+    ASSERT_TRUE(cmny_db_restore(&db, backup_path, currency, err, sizeof(err)));
+    ASSERT_TRUE(cmny_db_month_summary(&db, "2026-07", &summary, err, sizeof(err)));
+    ASSERT_EQ_I64(2, summary.transaction_count);
+    ASSERT_TRUE(unlink(backup_path) == 0);
+
     cmny_db_close(&db);
     ASSERT_TRUE(!cmny_db_open(&db, path, false, "USD", currency, err, sizeof(err)));
     ASSERT_TRUE(cmny_db_open(&db, path, false, NULL, currency, err, sizeof(err)));
@@ -156,13 +198,60 @@ int main(void) {
         "VALUES(1,-9223372036854775807,'Tampered','','2026-07-03')", NULL, NULL, NULL) == SQLITE_OK);
     ASSERT_TRUE(sqlite3_close(tampered) == SQLITE_OK);
     ASSERT_TRUE(cmny_db_open(&db, path, false, NULL, currency, err, sizeof(err)));
+    ASSERT_TRUE(!cmny_db_check(&db, err, sizeof(err)));
     ASSERT_TRUE(!cmny_db_month_summary(&db, "2026-07", &summary, err, sizeof(err)));
     ASSERT_TRUE(!cmny_db_list(&db, "2026-07", "", 0, 0, rows, 8, &count, err, sizeof(err)));
     cmny_db_close(&db);
     ASSERT_TRUE(sqlite3_open(path, &tampered) == SQLITE_OK);
     ASSERT_TRUE(sqlite3_exec(tampered, "DELETE FROM transactions WHERE amount_cents < 1",
                              NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_exec(tampered,
+        "PRAGMA ignore_check_constraints=ON;"
+        "INSERT INTO transactions(kind,amount_cents,category,note,occurred_on) "
+        "VALUES(1,1,'Long',printf('%121c','x'),'2026-07-03')",
+        NULL, NULL, NULL) == SQLITE_OK);
     ASSERT_TRUE(sqlite3_close(tampered) == SQLITE_OK);
+    ASSERT_TRUE(cmny_db_open(&db, path, false, NULL, currency, err, sizeof(err)));
+    ASSERT_TRUE(!cmny_db_check(&db, err, sizeof(err)));
+    ASSERT_TRUE(!cmny_db_list(&db, "2026-07", "", 0, 0, rows, 8, &count, err, sizeof(err)));
+    cmny_db_close(&db);
+    ASSERT_TRUE(sqlite3_open(path, &tampered) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_exec(tampered, "DELETE FROM transactions WHERE category='Long'",
+                             NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_close(tampered) == SQLITE_OK);
+
+    ASSERT_TRUE(sqlite3_open(path, &tampered) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_exec(tampered,
+        "PRAGMA ignore_check_constraints=ON;"
+        "INSERT INTO settings(key,value) VALUES('bad' || char(10) || 'key','value');"
+        "INSERT INTO budgets(month,category,limit_cents) VALUES('2026-99','Tampered',1);"
+        "INSERT INTO recurring(kind,amount_cents,category,note,day_of_month) "
+        "VALUES(1,1,'Tampered','',99)", NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_close(tampered) == SQLITE_OK);
+    ASSERT_TRUE(cmny_db_open(&db, path, false, NULL, currency, err, sizeof(err)));
+    ASSERT_TRUE(!cmny_db_check(&db, err, sizeof(err)));
+    ASSERT_TRUE(sqlite3_exec(db.handle, "DELETE FROM settings WHERE key LIKE 'bad%key'",
+                             NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(!cmny_db_check(&db, err, sizeof(err)));
+    ASSERT_TRUE(sqlite3_exec(db.handle, "DELETE FROM budgets WHERE category='Tampered'",
+                             NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(!cmny_db_check(&db, err, sizeof(err)));
+    ASSERT_TRUE(sqlite3_exec(db.handle, "DELETE FROM recurring WHERE category='Tampered'",
+                             NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(cmny_db_check(&db, err, sizeof(err)));
+    cmny_db_close(&db);
+
+    ASSERT_TRUE(sqlite3_open(path, &tampered) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_exec(tampered,
+        "DROP TABLE budgets; DROP TABLE recurring; PRAGMA user_version=1", NULL, NULL, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_close(tampered) == SQLITE_OK);
+    ASSERT_TRUE(cmny_db_open(&db, path, false, NULL, currency, err, sizeof(err)));
+    ASSERT_TRUE(sqlite3_prepare_v2(db.handle, "PRAGMA user_version", -1, &foreign_check, NULL) == SQLITE_OK);
+    ASSERT_TRUE(sqlite3_step(foreign_check) == SQLITE_ROW);
+    schema_version = sqlite3_column_int(foreign_check, 0);
+    ASSERT_EQ_I64(2, schema_version);
+    ASSERT_TRUE(sqlite3_finalize(foreign_check) == SQLITE_OK);
+    cmny_db_close(&db);
 
     sqlite3 *corrupt = NULL;
     ASSERT_TRUE(sqlite3_open(path, &corrupt) == SQLITE_OK);
