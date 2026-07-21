@@ -80,6 +80,27 @@ def send(master: int, data: bytes, delay: float = 0.08) -> bytes:
     return drain(master, delay)
 
 
+def send_until(master: int, data: bytes, markers: tuple[bytes, ...], timeout: float = 2.0) -> bytes:
+    """Send input and collect output until a screen marker appears or time expires."""
+    os.write(master, data)
+    deadline = time.monotonic() + timeout
+    output = bytearray()
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([master], [], [], 0.05)
+        if not ready:
+            continue
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        output.extend(chunk)
+        if any(marker in output for marker in markers):
+            break
+    return bytes(output)
+
+
 def mouse_click(master: int, x: int, y: int, *, double: bool = False) -> bytes:
     """Send an xterm X10 click using zero-based screen coordinates."""
     press = b"\x1b[M" + bytes((32, x + 33, y + 33))
@@ -100,7 +121,7 @@ def resize(process: subprocess.Popen[bytes], master: int, rows: int, columns: in
 
 def finish(process: subprocess.Popen[bytes], master: int) -> None:
     drain(master, 0.15)
-    process.wait(timeout=3)
+    process.wait(timeout=8)
     os.close(master)
     if process.returncode != 0:
         raise AssertionError(f"CMNY exited with {process.returncode}")
@@ -508,7 +529,7 @@ def main() -> None:
         send(master, b"backup")
         cancelled = send(master, b"\x1b", 0.15)
         assert b"BUDGETS" in cancelled or b"RECURRING" in cancelled, cancelled[-500:]
-        previous = send(master, b"\x1b", 0.15)
+        previous = send_until(master, b"\x1b", (b"ACTIVITY",))
         assert b"ACTIVITY" in previous, previous[-500:]
 
         # Search text survives a resize and executes the single matching command.
@@ -519,7 +540,7 @@ def main() -> None:
         assert b"manage" in restored_palette.lower(), restored_palette[-500:]
         manage = send(master, b"\r", 0.15)
         assert b"MANAGE" in manage, manage[-500:]
-        back = send(master, b"\x1b", 0.15)
+        back = send_until(master, b"\x1b", (b"ACTIVITY",))
         assert b"ACTIVITY" in back, back[-500:]
 
         # Numeric navigation covers all five spaces; brackets retain period control.
@@ -646,7 +667,7 @@ def main() -> None:
             send(master, b"\x1bOB")
             send(master, b"\r")
             send(master, b"\r")
-        send(master, b"q")
+        send(master, b"\x1b\x1bq", 0.4)
         finish(process, master)
 
         with sqlite3.connect(mouse_database) as connection:

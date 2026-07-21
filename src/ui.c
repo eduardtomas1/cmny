@@ -918,7 +918,7 @@ static void draw_transaction_rows(const UiState *state, const CmnyTransaction *i
             int category_width = amount_x - category_x - 1;
             if (category_width > 0) put_clipped(row, category_x, category_width, tx->category);
             if (row + 1 < y + height) {
-                char context[220];
+                char context[256];
                 if (meta != NULL) {
                     (void)snprintf(context, sizeof(context), "%s%s%s%s%s",
                                    meta->account,
